@@ -58,14 +58,19 @@ def applies(source, old):
 
 
 def run_mutant(source, old, new):
+    """Return the set of scenarios that failed, or None when the suite hung."""
     with tempfile.TemporaryDirectory(prefix="stoken-tui-mutant-") as work:
         tool = os.path.join(work, "stoken-tui")
         with open(tool, "w") as f:
             f.write(source.replace(old, new, 1))
         os.chmod(tool, 0o755)
         shutil.copy(os.path.join(ROOT, "touchid.swift"), work)
-        done = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tests", "e2e.py")], capture_output=True,
-                              text=True, env=dict(os.environ, STOKEN_TUI_BIN=tool), timeout=900)
+        env = dict(os.environ, STOKEN_TUI_BIN=tool, STOKEN_TUI_RESULTS=os.path.join(work, "e2e-results.txt"))
+        try:
+            done = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tests", "e2e.py")], capture_output=True,
+                                  text=True, env=env, timeout=900)
+        except subprocess.TimeoutExpired:
+            return None
     return set(re.findall(r"^FAIL\s+(S\d+)", done.stdout, re.M))
 
 
@@ -74,10 +79,11 @@ def main():
     parser.add_argument("--check", action="store_true", help="only confirm each mutation applies to the source")
     parser.add_argument("--only", default="", help="run the mutations whose name contains this text")
     args = parser.parse_args()
+    chosen = [m for m in MUTANTS if args.only in m[0]]
+    if not chosen:
+        sys.exit("no mutation name contains %r; run with --check to list them" % args.only)
     source, bad = load_source(), 0
-    for name, old, new, expected in MUTANTS:
-        if args.only not in name:
-            continue
+    for name, old, new, expected in chosen:
         if not applies(source, old):
             print("STALE     %s: its text no longer appears exactly once in stoken-tui" % name)
             bad += 1
@@ -86,6 +92,10 @@ def main():
             print("applies   %s" % name)
             continue
         reds = run_mutant(source, old, new)
+        if reds is None:
+            print("TIMED OUT %s: the suite hung for 15 minutes, so nothing was checked" % name)
+            bad += 1
+            continue
         missing = sorted(expected - reds)
         print("%-9s %s -> red: %s%s" % ("caught" if not missing else "SURVIVED", name, ",".join(sorted(reds)) or "none",
                                          "  (expected %s too)" % ",".join(missing) if missing else ""))
