@@ -1,0 +1,781 @@
+#!/usr/bin/env python3
+"""stoken-tui: a TOTP-app-like console view over stoken (RSA SecurID software tokens).
+
+The seed is the only secret. It lives in the macOS Keychain (one item per alias) and reaches stoken
+on a pipe, so no token file, password or temp file ever exists. ~/.stoken holds only a list of alias
+names. Design and failure matrix: docs/plan.md.
+"""
+import argparse
+import concurrent.futures
+import contextlib
+import fcntl
+import getpass
+import hashlib
+import os
+import re
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import termios
+import time
+import tty
+from dataclasses import dataclass
+from typing import Optional
+
+SERVICE = os.environ.get("STOKEN_TUI_SERVICE", "stoken-tui")
+SECURITY = os.environ.get("STOKEN_TUI_SECURITY", "/usr/bin/security")
+ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+SERVICE_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+ACCOUNT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}(\.trashed-\d+)?$")
+SEED_RE = re.compile(r"^\d{81}$")
+CALL_TIMEOUT = 8
+KEYCHAIN_TIMEOUT = float(os.environ.get("STOKEN_TUI_KEYCHAIN_TIMEOUT", "30"))
+CLIPBOARD_SECONDS = 30
+RETRY_SECONDS = 5
+KEYCHAIN_NOT_FOUND = 44
+MAX_TOKEN_BYTES = 32000
+BAR_WIDTH = 10
+GATED_COMMANDS = (None, "code", "export")
+TOUCH_ID_REASON = "unlock your SecurID tokens"
+HELPER_SOURCE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "touchid.swift")
+
+
+class Fail(Exception):
+    exit_code = 1
+
+
+class Usage(Fail):
+    exit_code = 2
+
+
+class KeychainUnavailable(Exception):
+    def __init__(self, status):
+        super().__init__("Keychain unavailable (exit %d)" % status)
+        self.status = status
+
+
+@dataclass
+class Row:
+    alias: str
+    code: Optional[str] = None
+    next_code: Optional[str] = None
+    interval: int = 60
+    error: Optional[str] = None
+    window: int = -1
+    fetched_at: float = 0.0
+
+
+# Alias index ------------------------------------------------------------------------------------
+# A plain list of alias names (no secrets), because the Keychain cannot list items by service.
+
+def token_dir():
+    return os.path.expanduser(os.environ.get("STOKEN_TUI_DIR", "~/.stoken"))
+
+
+def ensure_token_dir():
+    path = token_dir()
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    os.chmod(path, 0o700)
+    return path
+
+
+def check_alias(alias):
+    if not ALIAS_RE.fullmatch(alias or ""):
+        raise Usage("alias must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}: %r" % alias)
+
+
+def need_stoken():
+    if not shutil.which("stoken"):
+        raise Usage("stoken not found on PATH (brew install stoken)")
+
+
+def list_aliases():
+    try:
+        with open(os.path.join(token_dir(), "index")) as f:
+            names = f.read().split("\n")
+    except FileNotFoundError:
+        return []
+    return sorted({n for n in names if ALIAS_RE.fullmatch(n)})
+
+
+@contextlib.contextmanager
+def locked_index():
+    """Serialize read-modify-write of the index across concurrent runs; yield its current aliases."""
+    ensure_token_dir()
+    lock = open(os.path.join(token_dir(), ".lock"), "a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield list_aliases()
+    finally:
+        lock.close()
+
+
+def write_index(aliases):
+    path = os.path.join(token_dir(), "index")
+    partial = "%s.tmp-%d" % (path, os.getpid())
+    try:
+        with open(partial, "w") as f:
+            f.write("".join(a + "\n" for a in sorted(set(aliases))))
+        os.replace(partial, path)
+    finally:
+        unlink_quiet(partial)
+
+
+def unlink_quiet(path):
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+# stoken ---------------------------------------------------------------------------------------
+
+def call_stoken(args, stdin_text="", seed=None):
+    """Run stoken. A seed travels on a pipe file descriptor, never in argv, a file or the environment."""
+    if seed is None:
+        return run_stoken(args, stdin_text, ())
+    read_fd, write_fd = os.pipe()
+    try:
+        os.write(write_fd, (seed + "\n").encode())
+        os.close(write_fd)
+        return run_stoken([*args, "--file=/dev/fd/%d" % read_fd], stdin_text, (read_fd,))
+    finally:
+        os.close(read_fd)
+
+
+def run_stoken(args, stdin_text, pass_fds):
+    try:
+        return subprocess.run(["stoken", *args], input=stdin_text, capture_output=True, text=True,
+                              errors="replace", timeout=CALL_TIMEOUT, pass_fds=pass_fds)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 124, "", "timed out")
+
+
+def first_line(text):
+    lines = [ln for ln in text.strip().splitlines() if ln.strip()]
+    return lines[-1].strip() if lines else "stoken failed"
+
+
+def interval_of(shown):
+    m = re.search(r"Seconds per tokencode\s*:\s*(\d+)", shown)
+    return int(m.group(1)) if m else 60
+
+
+def classify_failure(res):
+    text = res.stdout + "\n" + res.stderr
+    if res.returncode == 124:
+        return "timed out"
+    if "PIN must be" in text or "only allows one prompt" in text:
+        return "PIN required"
+    if "garbled" in text or "no token present" in text or "no valid token" in text:
+        return "seed unreadable"
+    return first_line(res.stderr or res.stdout)
+
+
+def normalize_seed(raw):
+    """Turn an sdtid file, CTF string or activation link into stoken's plain 81-digit string."""
+    if len(raw.encode()) > MAX_TOKEN_BYTES:
+        raise Fail("that is too large to be a token")
+    res = call_stoken(["export", "--batch"], seed=raw)
+    seed = res.stdout.strip()
+    if res.returncode != 0 or not SEED_RE.fullmatch(seed):
+        raise Fail("not a usable token: " + first_line(res.stderr or res.stdout))
+    return seed
+
+
+# Keychain -------------------------------------------------------------------------------------
+# Seeds live under SERVICE, PINs under SERVICE + ".pin"; the account is the alias.
+
+def service_name(pin):
+    return SERVICE + (".pin" if pin else "")
+
+
+def keychain(args, stdin_text=None):
+    if not SERVICE_RE.fullmatch(SERVICE):
+        raise Usage("STOKEN_TUI_SERVICE has characters outside [A-Za-z0-9._-]")
+    try:
+        return subprocess.run([SECURITY, *args], input=stdin_text, capture_output=True, text=True,
+                              errors="replace", timeout=KEYCHAIN_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise KeychainUnavailable(124)
+
+
+def kc_get(account, pin=False):
+    res = keychain(["find-generic-password", "-s", service_name(pin), "-a", account, "-w"])
+    if res.returncode == 0:
+        return res.stdout[:-1] if res.stdout.endswith("\n") else res.stdout
+    if res.returncode == KEYCHAIN_NOT_FOUND:
+        return None
+    raise KeychainUnavailable(res.returncode)
+
+
+def kc_put(account, value, pin=False):
+    """Store a value, then read it back: `security -i` can exit 0 without storing anything."""
+    if not ACCOUNT_RE.fullmatch(account):
+        raise Usage("bad Keychain account name: %r" % account)
+    line = 'add-generic-password -s "%s" -a "%s" -X %s\n' % (service_name(pin), account, value.encode().hex())
+    res = keychain(["-i"], line)
+    if res.returncode != 0:
+        raise Fail("Keychain write failed (exit %d): %s" % (res.returncode, res.stderr.strip()))
+    if kc_get(account, pin) != value:
+        raise Fail("Keychain write did not stick for account %s" % account)
+
+
+def kc_delete(account, pin=False):
+    keychain(["delete-generic-password", "-s", service_name(pin), "-a", account])
+
+
+# Reading codes ----------------------------------------------------------------------------------
+
+def fetch_row(alias, now, use_time=None):
+    try:
+        return read_row(alias, now, use_time)
+    except Exception as e:
+        return Row(alias, error=first_line(str(e)), fetched_at=now)
+
+
+def read_row(alias, now, use_time=None):
+    row = Row(alias, fetched_at=now)
+    try:
+        seed, pin = kc_get(alias), kc_get(alias, pin=True)
+    except KeychainUnavailable as e:
+        row.error = str(e)
+        return row
+    if seed is None:
+        row.error = "no seed in Keychain"
+        return row
+    row.interval = interval_of(call_stoken(["show", "--batch"], seed=seed).stdout)
+    when = int(use_time or time.time())
+    row.window = when // row.interval
+    codes = []
+    for offset in (0, row.interval):
+        res = call_stoken(["tokencode", "--batch", "--stdin", "--use-time=%d" % (when + offset)], (pin or "") + "\n", seed)
+        if res.returncode != 0 or not res.stdout.strip().isdigit():
+            row.error = classify_failure(res)
+            return row
+        codes.append(res.stdout.strip())
+    row.code, row.next_code = codes
+    return row
+
+
+def fetch_all(aliases, now, use_time=None):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        return list(pool.map(lambda a: fetch_row(a, now, use_time), aliases))
+
+
+def seconds_left(row, now):
+    return row.interval - int(now) % row.interval
+
+
+def format_code(code):
+    if len(code) in (6, 8):
+        half = len(code) // 2
+        return code[:half] + " " + code[half:]
+    return code
+
+
+def bar(left, interval):
+    filled = round(BAR_WIDTH * left / interval)
+    return "█" * filled + "░" * (BAR_WIDTH - filled)
+
+
+def render_row(row, name_width, now):
+    name = row.alias.ljust(name_width)
+    if row.error:
+        return "%s  ! %s" % (name, row.error)
+    if row.code is None:
+        return "%s  ..." % name
+    left = seconds_left(row, now)
+    return "%s  %-9s  %2ds  %s" % (name, format_code(row.code), left, bar(left, row.interval))
+
+
+def render_frame(rows, now):
+    width = max(len(r.alias) for r in rows)
+    return "\n".join(render_row(r, width, now) for r in rows)
+
+
+EMPTY_HINT = "No tokens yet. Add one with: stoken-tui add ALIAS --file TOKEN.sdtid"
+
+
+# Live view --------------------------------------------------------------------------------------
+# Drawn with plain ANSI escape sequences, not curses: ncurses' repeat-character optimization mangles
+# runs of wide glyphs (measured: a stray byte 0x01 before ESC[Nb in a UTF-8 session).
+
+CARD_HEIGHT = 4
+FOOTER_LINES = 2
+CODE_WIDTH = 10
+BAR_MAX = 32
+SGR = {"bold": "1", "dim": "2", "red": "31", "green": "32", "yellow": "33", "cyan": "36"}
+KEY_TOKENS = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z~]|\x1bO[A-Za-z]|\x1b|.", re.S)
+KEY_NAMES = {b"\x1b[A": "up", b"\x1bOA": "up", b"k": "up", b"\x1b[B": "down", b"\x1bOB": "down", b"j": "down",
+             b"c": "copy", b"\r": "copy", b"\n": "copy", b"n": "next", b"q": "quit", b"\x1b": "quit", b"\x03": "quit"}
+UNICODE_GLYPHS = {"marker": "▌", "full": "━", "half": "╸", "empty": "─", "rule": "─", "ok": "✓", "err": "!",
+                  "wait": "…", "hint": "↑↓ select    Enter copy    n copy next    q quit"}
+ASCII_GLYPHS = {"marker": ">", "full": "#", "half": "#", "empty": "-", "rule": "-", "ok": "*", "err": "!",
+                "wait": "...", "hint": "up/down select    Enter copy    n copy next    q quit"}
+
+
+def pick_glyphs():
+    """Box-drawing glyphs by default; STOKEN_TUI_ASCII=1 switches to plain ASCII for old terminals."""
+    return ASCII_GLYPHS if os.environ.get("STOKEN_TUI_ASCII") else UNICODE_GLYPHS
+
+
+def parse_keys(data):
+    return [KEY_NAMES.get(token) for token in KEY_TOKENS.findall(data)]
+
+
+def is_stale(row, pending, index, now):
+    if index in pending:
+        return False
+    if row.error:
+        return now - row.fetched_at >= RETRY_SECONDS
+    return row.window != int(now) // row.interval
+
+
+def refresh_rows(pool, rows, pending, now):
+    for i, row in enumerate(rows):
+        if is_stale(row, pending, i, now):
+            pending[i] = pool.submit(fetch_row, row.alias, now)
+
+
+def harvest(rows, pending, now):
+    for i, future in list(pending.items()):
+        if not future.done():
+            continue
+        del pending[i]
+        rows[i] = future.result()
+
+
+def tint(left):
+    if left <= 10:
+        return "red"
+    return "yellow" if left <= 20 else "green"
+
+
+def render_line(segments, width):
+    """Segments are (text, styles) pairs. Clip to the width, then wrap each styled piece in SGR codes."""
+    room, parts = max(0, width - 1), []
+    for text, styles in segments:
+        text = text[:room]
+        room -= len(text)
+        if text and styles:
+            text = "\x1b[%sm%s\x1b[0m" % (";".join(SGR[s] for s in styles), text)
+        parts.append(text)
+    return "".join(parts)
+
+
+def bar_segments(width, fraction, color, glyphs):
+    full, half = divmod(round(2 * width * fraction), 2)
+    filled = glyphs["full"] * full + (glyphs["half"] if half else "")
+    return [(filled, ("bold", color)), (glyphs["empty"] * (width - len(filled)), ("dim",))]
+
+
+def countdown_segments(row, width, now, glyphs):
+    left = seconds_left(row, now)
+    color = tint(left)
+    bar_width = min(BAR_MAX, width - (3 + CODE_WIDTH) - 8)
+    seconds = [("%2ds" % left, ("bold", color))]
+    if bar_width < 6:
+        return seconds
+    fraction = (row.interval - now % row.interval) / row.interval
+    return bar_segments(bar_width, fraction, color, glyphs) + [("  ", ())] + seconds
+
+
+def card_lines(row, selected, width, now, glyphs):
+    marker = (glyphs["marker"] if selected else " ", ("bold", "cyan"))
+    head = [(" ", ()), marker, (" ", ()), (row.alias, ("bold",) if selected else ("dim",))]
+    side = [(" ", ()), marker, (" ", ())]
+    upcoming = []
+    if row.error:
+        body = side + [("%s %s" % (glyphs["err"], row.error), ("red",))]
+    elif row.code is None:
+        body = side + [(glyphs["wait"], ("dim",))]
+    else:
+        code = format_code(row.code)
+        body = side + [(code, ("bold",)), (" " * (CODE_WIDTH - len(code)), ())] + countdown_segments(row, width, now, glyphs)
+        upcoming = side + [("next " + format_code(row.next_code), ("dim",))]
+    return [render_line(head, width), render_line(body, width), render_line(upcoming, width), ""]
+
+
+def home_relative(path):
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path.startswith(home + os.sep) else path
+
+
+def frame_lines(rows, selected, toast, size, now, glyphs):
+    width, height = size
+    count = "%d token%s" % (len(rows), "" if len(rows) == 1 else "s")
+    gap = max(1, width - 1 - len("stoken-tui") - len(count) - 2)
+    lines = [render_line([(" ", ()), ("stoken-tui", ("bold",)), (" " * gap, ()), (count, ("dim",))], width),
+             render_line([(" " + glyphs["rule"] * (width - 2), ("dim",))], width), ""]
+    per_page = max(1, (height - FOOTER_LINES - 3) // CARD_HEIGHT)
+    start = max(0, selected - per_page + 1)
+    for index in range(start, min(len(rows), start + per_page)):
+        lines += card_lines(rows[index], index == selected, width, now, glyphs)
+    lines = (lines + [""] * height)[:height - FOOTER_LINES]
+    keys = ([(" %s %s" % (glyphs["ok"], toast[0]), ("bold", "green"))] if toast[1] > now
+            else [(" " + glyphs["hint"], ("dim",))])
+    where = [(" names: %s    rename: stoken-tui rename OLD NEW" % home_relative(os.path.join(token_dir(), "index")), ("dim",))]
+    return lines + [render_line(keys, width), render_line(where, width)]
+
+
+def paint(lines):
+    out = "".join("\x1b[%d;1H%s\x1b[K" % (i + 1, line) for i, line in enumerate(lines))
+    os.write(1, out.encode())
+
+
+def terminal_size():
+    try:
+        size = os.get_terminal_size(1)
+    except OSError:
+        size = None
+    if size and size.columns > 0 and size.lines > 0:
+        return size.columns, size.lines
+    fallback = shutil.get_terminal_size()
+    return fallback.columns, fallback.lines
+
+
+def move(key, selected, count):
+    step = {"up": -1, "down": 1}.get(key, 0)
+    return max(0, min(count - 1, selected + step))
+
+
+def copy_code(row, now, upcoming=False):
+    code = row.next_code if upcoming else row.code
+    if not code:
+        return ("nothing to copy yet", now + 2), None
+    subprocess.run(["pbcopy"], input=code, text=True)
+    label = "next code of %s" % row.alias if upcoming else row.alias
+    return ("copied %s" % label, now + 2), (code, now + CLIPBOARD_SECONDS)
+
+
+def clear_clipboard(code):
+    held = subprocess.run(["pbpaste"], capture_output=True, text=True)
+    if held.stdout == code:
+        subprocess.run(["pbcopy"], input="", text=True)
+
+
+def run_live(glyphs):
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    rows = [Row(a) for a in list_aliases()]
+    pending, selected, toast, clip = {}, 0, ("", 0.0), None
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+    try:
+        tty.setcbreak(fd)
+        os.write(1, b"\x1b[?1049h\x1b[?25l")
+        while True:
+            now = time.time()
+            refresh_rows(pool, rows, pending, now)
+            harvest(rows, pending, now)
+            paint(frame_lines(rows, selected, toast, terminal_size(), now, glyphs))
+            for key in parse_keys(os.read(fd, 64)) if select.select([fd], [], [], 0.25)[0] else []:
+                if key == "quit":
+                    return 0
+                selected = move(key, selected, len(rows))
+                if key in ("copy", "next"):
+                    toast, clip = copy_code(rows[selected], now, upcoming=key == "next")
+            if clip and now >= clip[1]:
+                clear_clipboard(clip[0])
+                clip = None
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+        os.write(1, b"\x1b[?25h\x1b[?1049l")
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        if clip:
+            clear_clipboard(clip[0])
+
+
+# Commands ---------------------------------------------------------------------------------------
+
+def args_use_time(args):
+    return getattr(args, "use_time", None)
+
+
+def cmd_frame(args):
+    need_stoken()
+    aliases = list_aliases()
+    if not aliases:
+        print(EMPTY_HINT)
+        return 0
+    now = args_use_time(args) or time.time()
+    print(render_frame(fetch_all(aliases, now, args_use_time(args)), now))
+    return 0
+
+
+def cmd_live(args):
+    need_stoken()
+    if not list_aliases():
+        print(EMPTY_HINT)
+        return 0
+    exit_on_signal()
+    status = run_live(pick_glyphs())
+    sys.stdout.flush()
+    os._exit(status)
+
+
+def cmd_code(args):
+    need_stoken()
+    check_alias(args.alias)
+    if args.alias not in list_aliases():
+        raise Fail("no such alias: %s" % args.alias)
+    row = fetch_row(args.alias, time.time(), args_use_time(args))
+    if row.error:
+        raise Fail("%s: %s" % (args.alias, row.error))
+    print(row.next_code if args.next else row.code)
+    return 0
+
+
+def cmd_export(args):
+    check_alias(args.alias)
+    seed = kc_get(args.alias)
+    if seed is None:
+        raise Fail("no such alias: %s" % args.alias)
+    print(seed)
+    return 0
+
+
+def has_tty():
+    try:
+        with open("/dev/tty"):
+            return True
+    except OSError:
+        return False
+
+
+def ask_secret(env_name, prompt):
+    if env_name in os.environ:
+        return os.environ.pop(env_name) or None
+    if not has_tty():
+        return None
+    return getpass.getpass(prompt) or None
+
+
+def read_token_text(args):
+    if args.file:
+        if not os.path.isfile(args.file):
+            raise Fail("no such file: %s" % args.file)
+        with open(args.file, errors="replace") as f:
+            return f.read(MAX_TOKEN_BYTES + 1).strip()
+    data = (getpass.getpass("Token (hidden): ") if sys.stdin.isatty() else sys.stdin.read()).strip()
+    if not data:
+        raise Fail("no token given")
+    return data
+
+
+def exit_on_signal():
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda signum, frame: sys.exit(128 + signum))
+
+
+def refuse_existing(alias, aliases):
+    if alias in aliases or kc_get(alias) is not None:
+        raise Fail("alias already exists: %s" % alias)
+
+
+def verify_readable(alias):
+    res = call_stoken(["show", "--batch"], seed=kc_get(alias))
+    if res.returncode != 0 or "Serial number" not in res.stdout:
+        raise Fail("verification failed: " + first_line(res.stderr or res.stdout))
+
+
+def register(alias, seed, pin):
+    """Index first, then Keychain, then a read-back; undo everything on any failure or signal."""
+    exit_on_signal()
+    with locked_index() as aliases:
+        refuse_existing(alias, aliases)
+        write_index(aliases + [alias])
+        try:
+            kc_put(alias, seed)
+            if pin:
+                kc_put(alias, pin, pin=True)
+            verify_readable(alias)
+        except BaseException:
+            write_index(aliases)
+            with contextlib.suppress(Exception):
+                kc_delete(alias)
+                kc_delete(alias, pin=True)
+            raise
+
+
+def cmd_add(args):
+    need_stoken()
+    check_alias(args.alias)
+    pin = ask_secret("STOKEN_TUI_PIN", "PIN (Enter if the token has none): ")
+    register(args.alias, normalize_seed(read_token_text(args)), pin)
+    print("Added %s." % args.alias)
+    print("Keep the original token (.sdtid file or activation link) in your password manager: it is the")
+    print("recovery copy. `stoken-tui export %s` prints the seed if you want that saved too." % args.alias)
+    return 0
+
+
+def cmd_adopt(args):
+    need_stoken()
+    check_alias(args.alias)
+    if not os.path.isfile(args.rcfile):
+        raise Fail("no such file: %s" % args.rcfile)
+    password = ask_secret("STOKEN_TUI_PASSWORD", "Password of that token (Enter if none): ")
+    res = call_stoken(["export", "--batch", "--stdin", "--rcfile=" + args.rcfile], (password or "") + "\n")
+    seed = res.stdout.strip()
+    if res.returncode != 0 or not SEED_RE.fullmatch(seed):
+        raise Fail("wrong password, or not a stoken rc file")
+    pin = ask_secret("STOKEN_TUI_PIN", "PIN, if that token used one (Enter if none): ")
+    register(args.alias, seed, pin)
+    print("Adopted %s into the Keychain; the original file is unchanged." % args.alias)
+    print("Once the new entry works, trash the original: it is protected only by its old password.")
+    return 0
+
+
+def cmd_rename(args):
+    check_alias(args.old)
+    check_alias(args.new)
+    exit_on_signal()
+    with locked_index() as aliases:
+        seed, pin = kc_get(args.old), kc_get(args.old, pin=True)
+        if args.old not in aliases or seed is None:
+            raise Fail("no such alias: %s" % args.old)
+        refuse_existing(args.new, aliases)
+        try:
+            kc_put(args.new, seed)
+            if pin:
+                kc_put(args.new, pin, pin=True)
+            write_index([a for a in aliases if a != args.old] + [args.new])
+        except BaseException:
+            write_index(aliases)
+            with contextlib.suppress(Exception):
+                kc_delete(args.new)
+                kc_delete(args.new, pin=True)
+            raise
+        with contextlib.suppress(Exception):
+            kc_delete(args.old)
+            kc_delete(args.old, pin=True)
+    print("Renamed %s to %s." % (args.old, args.new))
+    return 0
+
+
+def cmd_rm(args):
+    check_alias(args.alias)
+    exit_on_signal()
+    with locked_index() as aliases:
+        seed, pin = kc_get(args.alias), kc_get(args.alias, pin=True)
+        if args.alias not in aliases and seed is None:
+            raise Fail("no such alias: %s" % args.alias)
+        verb = "Delete %s for good (no recovery)" if args.purge else "Remove %s"
+        if not args.yes and input(verb % args.alias + "? [y/N] ").strip().lower() != "y":
+            raise Fail("cancelled")
+        keep = None if args.purge or seed is None else "%s.trashed-%d" % (args.alias, int(time.time()))
+        if keep:
+            kc_put(keep, seed)
+            if pin:
+                kc_put(keep, pin, pin=True)
+        write_index([a for a in aliases if a != args.alias])
+        kc_delete(args.alias)
+        kc_delete(args.alias, pin=True)
+    print("Removed %s." % args.alias)
+    if keep:
+        print("Its seed is kept as Keychain account %s." % keep)
+    return 0
+
+
+# Touch ID gate ----------------------------------------------------------------------------------
+# A guard on this app only: any process running as you can still read the Keychain item with
+# `security`. STOKEN_TUI_AUTH=off skips the gate (ssh sessions, scripts); any other value is a command
+# that stands in for the helper (tests).
+
+def helper_path():
+    """Build touchid.swift once per source version and reuse the binary."""
+    digest = hashlib.sha256(open(HELPER_SOURCE, "rb").read()).hexdigest()[:12]
+    cache = os.path.expanduser(os.environ.get("STOKEN_TUI_CACHE", "~/.cache/stoken-tui"))
+    exe = os.path.join(cache, "touchid-" + digest)
+    if os.access(exe, os.X_OK):
+        return exe
+    swiftc = shutil.which("swiftc")
+    if not swiftc:
+        raise Fail("the Touch ID helper needs swiftc (xcode-select --install); STOKEN_TUI_AUTH=off skips the check")
+    os.makedirs(cache, mode=0o700, exist_ok=True)
+    partial = "%s.build-%d" % (exe, os.getpid())
+    built = subprocess.run([swiftc, "-O", "-o", partial, HELPER_SOURCE], capture_output=True, text=True,
+                           errors="replace", timeout=300)
+    if built.returncode != 0:
+        unlink_quiet(partial)
+        raise Fail("building the Touch ID helper failed: " + first_line(built.stderr))
+    os.replace(partial, exe)
+    return exe
+
+
+def require_touch_id():
+    setting = os.environ.get("STOKEN_TUI_AUTH", "")
+    if setting == "off":
+        return
+    command = [setting] if setting else [helper_path(), TOUCH_ID_REASON]
+    try:
+        res = subprocess.run(command, capture_output=True, text=True, errors="replace", timeout=120)
+    except subprocess.TimeoutExpired:
+        raise Fail("Touch ID check timed out")
+    if res.returncode == 0:
+        return
+    hint = " (STOKEN_TUI_AUTH=off skips the check, for example over ssh)" if res.returncode == 2 else ""
+    raise Fail("Touch ID check failed: %s%s" % (res.stderr.strip() or "cancelled", hint))
+
+
+# Entry point -----------------------------------------------------------------------------------
+
+def build_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--use-time", type=int, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    p = argparse.ArgumentParser(prog="stoken-tui", parents=[common],
+                                description="Live view of every stoken token, seeds in the Keychain.")
+    p.add_argument("--once", action="store_true", help="print one frame and exit")
+    sub = p.add_subparsers(dest="cmd")
+    add = sub.add_parser("add", help="add a token under an alias")
+    add.add_argument("alias")
+    src = add.add_mutually_exclusive_group(required=True)
+    src.add_argument("--file", help="a .sdtid file, or a file holding a CTF string or link")
+    src.add_argument("--token", choices=["-"], help="read the CTF string or link from stdin")
+    adopt = sub.add_parser("adopt", help="take over an existing encrypted rc, such as ~/.stokenrc")
+    adopt.add_argument("alias")
+    adopt.add_argument("rcfile")
+    code = sub.add_parser("code", parents=[common], help="print one alias's current code")
+    code.add_argument("alias")
+    code.add_argument("--next", action="store_true", help="print the code for the next interval instead")
+    export = sub.add_parser("export", help="print the stored seed (81 digits) of an alias")
+    export.add_argument("alias")
+    rename = sub.add_parser("rename", help="give an alias a new name")
+    rename.add_argument("old")
+    rename.add_argument("new")
+    rm = sub.add_parser("rm", help="remove an alias, keeping its seed under a .trashed account")
+    rm.add_argument("alias")
+    rm.add_argument("--yes", action="store_true")
+    rm.add_argument("--purge", action="store_true", help="delete the seed too, with no recovery")
+    return p
+
+
+COMMANDS = {"add": cmd_add, "adopt": cmd_adopt, "code": cmd_code, "export": cmd_export, "rename": cmd_rename,
+            "rm": cmd_rm}
+
+
+def main(argv=None):
+    os.umask(0o077)
+    args = build_parser().parse_args(argv)
+    try:
+        if args.cmd in GATED_COMMANDS:
+            require_touch_id()
+        if args.cmd:
+            return COMMANDS[args.cmd](args)
+        if args.once or not (sys.stdout.isatty() and sys.stdin.isatty()):
+            return cmd_frame(args)
+        return cmd_live(args)
+    except KeychainUnavailable as e:
+        print("stoken-tui: %s" % e, file=sys.stderr)
+        return 1
+    except Fail as e:
+        print("stoken-tui: %s" % e, file=sys.stderr)
+        return e.exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
