@@ -62,5 +62,5 @@ Type "q"
 Sleep 800ms
 
 Hide
-Type "python3 demo/fixture.py cleanup" Enter
-Sleep 4s
+Type "python3 demo/fixture.py cleanup; echo CLEAN''ED" Enter
+Wait+Screen /CLEANED/
