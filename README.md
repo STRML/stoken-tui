@@ -135,6 +135,8 @@ The login keychain is the only store, and Time Machine backs it up with your hom
 
 If your admin sent an activation link that looks like `com.rsa.securid://ctkip?url=...&activationCode=...`, stoken can't import it, because the link holds a one-time code and a provisioning URL, not the token. [rsa_ct_kip](https://github.com/dlenski/rsa_ct_kip) fetches the token from the server and writes the `.sdtid` file that `add --file` takes. The activation code works once, so keep the file.
 
+If a token made this way shows `! PIN required` although your server uses no PIN, the template that rsa_ct_kip writes is the cause: it spells a tag `DefAddPin`, which stoken ignores ([dlenski/rsa_ct_kip#11](https://github.com/dlenski/rsa_ct_kip/pull/11)). Until that lands, run the conversion by hand with `<DefAddPIN>0</DefAddPIN>` and `<DefLocalPIN>0</DefLocalPIN>` added to the template. With both, `stoken show` reports PIN mode 0.
+
 </details>
 
 ## What it relies on
@@ -161,6 +163,8 @@ python3 tests/e2e.py
 ```
 
 The suite runs 34 scenarios against a temporary directory and a throwaway Keychain service, with `stoken` and `pbcopy` wrapped in shims that log every call. It checks what reached each command line (no seed, PIN or password may), what ended up on disk (no seed anywhere), and what the screen looks like in a real tmux pane. It needs the real `stoken`, `security` and `tmux`, and Touch ID is stubbed out.
+
+A passing suite says little if a scenario can't fail. `python3 tests/mutants.py` breaks the tool in 18 named ways, one line each, and checks that the scenario guarding each one goes red. A full run takes about 40 minutes, so it isn't part of CI. `--check` confirms the mutations still apply to the source in a second.
 
 The screenshots and the animation come from made-up tokens. `demo/fixture.py` builds five of them with different intervals, and `vhs demo/demo.tape` re-renders everything. The design notes and the failure matrix behind each scenario are in [docs/plan.md](docs/plan.md).
 
