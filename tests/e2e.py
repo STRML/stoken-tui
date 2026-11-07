@@ -17,7 +17,7 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.environ.get("STOKEN_TUI_BIN") or os.path.join(ROOT, "stoken-tui")
-RESULTS = os.path.join(ROOT, "tests", "e2e-results.txt")
+RESULTS = os.environ.get("STOKEN_TUI_RESULTS") or os.path.join(ROOT, "tests", "e2e-results.txt")
 T = 1700000000
 LEFT = 60 - (T % 60)
 PIN = "73915"
