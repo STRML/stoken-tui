@@ -67,6 +67,7 @@ MUTANTS = [
     ("sh trampoline accepted", "os.path.basename(interpreter) in NO_SHEBANG_INTERPRETERS or ", "", {"S39"}),
     ("http links accepted", 'parts.scheme != "https"', 'parts.scheme not in ("https", "http")', {"S37"}),
     ("requests keep the connection", '    session.headers["Connection"] = "close"', "    pass", {"S35"}),
+    ("token prompt hides input", "        entry = ask_line(TOKEN_PROMPT)", "        entry = ask_line(TOKEN_PROMPT, secret=True)", {"S54"}),
 ]
 
 

@@ -963,8 +963,9 @@ def _():
     open(env_script, "w").write("#!/usr/bin/env python3\n")
     for p in (sh_script, env_script):
         os.chmod(p, 0o755)
+    bare_path = os.pathsep.join(d for d in env["PATH"].split(os.pathsep) if not os.access(os.path.join(d, "rsa_ct_kip"), os.X_OK))
     for label, helper in (("missing", os.path.join(work, "nope")), ("sh", sh_script), ("env", env_script), ("not set", "")):
-        rc, out, err = kip_add("nohelper", STOKEN_TUI_CTKIP=helper)
+        rc, out, err = kip_add("nohelper", STOKEN_TUI_CTKIP=helper, PATH=bare_path)
         check(rc == 2 and "STOKEN_TUI_CTKIP" in err, "%s: exit %d, hint missing: %r" % (label, rc, err))
         check(not kip_log() and not stored("nohelper"), "%s: helper ran or something was stored" % label)
     rc, _, err = kip_add("viapath", STOKEN_TUI_CTKIP="", PATH=kipdir + os.pathsep + env["PATH"])
@@ -1300,6 +1301,30 @@ def _():
         check("first" in shown, "the new row did not appear:\n" + shown)
         pane.key("q")
         check(exit_code(pane.expect("__EXIT__")) == 0, "quit failed")
+    finally:
+        pane.close()
+
+
+def type_without_enter(pane, text):
+    subprocess.run(pane.tm + ["send-keys", "-t", pane.name, "-l", text], check=True)
+
+
+@scenario("S54 the token prompt shows what you type, and the PIN prompt still hides it")
+def _():
+    accounts_to_clean.add("wiz54")
+    pane = Pane(["add", "wiz54"], os.path.join(work, "wiz54"))
+    try:
+        shown = pane.expect("Token (paste")
+        check("hidden" not in shown, "the token prompt still says hidden:\n" + shown)
+        type_without_enter(pane, "visible-token-probe")
+        pane.expect("visible-token-probe", timeout=5)
+        pane.key("C-u")
+        pane.send(fx_a)
+        pane.expect("PIN (Enter")
+        type_without_enter(pane, "hidden-pin-probe")
+        time.sleep(1)
+        check("hidden-pin-probe" not in pane.screen(), "the PIN was echoed:\n" + pane.screen())
+        pane.key("C-c")
     finally:
         pane.close()
 

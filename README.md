@@ -25,7 +25,7 @@ with it   stoken-tui ─▶ Touch ID ─▶ every code, counting down
 
 ## Install
 
-You need macOS, [stoken](https://github.com/stoken-dev/stoken) (`brew install stoken`) and Python 3.9 or later. The Touch ID helper compiles once with `swiftc`, which comes with the Xcode command line tools (`xcode-select --install`). There are no Python dependencies. Importing an activation link also needs `rsa_ct_kip`, described under "Getting a token in the first place".
+You need macOS, [stoken](https://github.com/stoken-dev/stoken) (`brew install stoken`) and Python 3.9 or later. The Touch ID helper compiles once with `swiftc`, which comes with the Xcode command line tools (`xcode-select --install`). There are no Python dependencies. Importing an activation link also needs `rsa_ct_kip` (`uv tool install rsa-ct-kip`), described under "Getting a token in the first place".
 
 ```sh
 git clone https://github.com/STRML/stoken-tui
@@ -88,7 +88,7 @@ stoken-tui code work --next
 | Print the stored seed | `stoken-tui export NAME` |
 | Remove a token | `stoken-tui rm NAME` (`--purge` also deletes its seed) |
 
-`add` asks for whatever you left out: the name, then the token (hidden; paste a link or a CTF string, or drop in the path of an `.sdtid` file), then the PIN. Names may hold spaces (`my vpn`) and 64 characters at most. Press Enter at the PIN if the token has none. `adopt` asks for a PIN too.
+`add` asks for whatever you left out: the name, then the token (shown as you type; paste a link or a CTF string, or drop in the path of an `.sdtid` file), then the PIN. Names may hold spaces (`my vpn`) and 64 characters at most. Press Enter at the PIN if the token has none. `adopt` asks for a PIN too.
 
 Don't edit the name list by hand. The footer shows where it lives (`~/.stoken/index`), but each name is also the Keychain account that holds the seed, so changing one without the other loses the token. `rename` changes both.
 
@@ -136,7 +136,7 @@ The login keychain is the only store, and Time Machine backs it up with your hom
 
 <br>
 
-An admin may send a link like `com.rsa.securid://ctkip?url=...&activationCode=...`. Paste it into `stoken-tui add`. The link carries a one-time code and a server address, and stoken-tui trades them for the token through [rsa_ct_kip](https://github.com/dlenski/rsa_ct_kip) (`pip install rsa-ct-kip`, or point `STOKEN_TUI_CTKIP` at its script).
+An admin may send a link like `com.rsa.securid://ctkip?url=...&activationCode=...`. Paste it into `stoken-tui add`. The link carries a one-time code and a server address, and stoken-tui trades them for the token through [rsa_ct_kip](https://github.com/dlenski/rsa_ct_kip) (`uv tool install rsa-ct-kip` or `pipx install rsa-ct-kip`, which put `rsa_ct_kip` on your PATH; or point `STOKEN_TUI_CTKIP` at its script). Homebrew's Python refuses a bare `pip install`, so use one of those two.
 
 ```
 link ─▶ checks ─▶ you confirm the host ─▶ rsa_ct_kip ─▶ recovery.sdtid ─▶ Keychain ─▶ folder deleted

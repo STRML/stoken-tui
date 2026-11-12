@@ -47,7 +47,7 @@ HOSTNAME_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$")
 HEX_RUN_RE = re.compile(r"\b[0-9a-fA-F]{32}\b")
 NO_SHEBANG_INTERPRETERS = ("sh", "bash", "zsh", "dash", "env")
 NAME_PROMPT = "Name for this token: "
-TOKEN_PROMPT = "Token (paste a link or string, or give an .sdtid path; hidden): "
+TOKEN_PROMPT = "Token (paste a link or string, or give an .sdtid path): "
 PIN_PROMPT = "PIN (Enter if the token has none): "
 PROMPT_TRIES = 3
 TOUCH_ID_REASON = "unlock your SecurID tokens"
@@ -278,7 +278,7 @@ def find_helper():
     """Return the Python that runs rsa_ct_kip, taken from the script's shebang line."""
     path = os.environ.get("STOKEN_TUI_CTKIP") or shutil.which("rsa_ct_kip")
     if not path or not os.path.isfile(path) or not os.access(path, os.X_OK):
-        raise Usage("rsa_ct_kip not found: install it with `pip install rsa-ct-kip`, or set STOKEN_TUI_CTKIP to the script")
+        raise Usage("rsa_ct_kip not found: install it with `uv tool install rsa-ct-kip` or `pipx install rsa-ct-kip`, or set STOKEN_TUI_CTKIP to the script")
     with open(path, "rb") as f:
         first = f.readline(512).decode(errors="replace").strip()
     found = re.fullmatch(r"#!\s*(/\S+)", first)
@@ -839,7 +839,7 @@ def read_token_text(args):
         if not os.path.isfile(args.file):
             raise Fail("no such file: %s" % args.file)
         return read_token_file(args.file)
-    data = token_from_entry(getpass.getpass(TOKEN_PROMPT).strip()) if sys.stdin.isatty() else sys.stdin.read().strip()
+    data = token_from_entry(input(TOKEN_PROMPT).strip()) if sys.stdin.isatty() else sys.stdin.read().strip()
     if not data:
         raise Fail("no token given")
     return data
@@ -906,7 +906,7 @@ def prompt_alias():
 
 def prompt_token_text():
     for _ in range(PROMPT_TRIES):
-        entry = ask_line(TOKEN_PROMPT, secret=True)
+        entry = ask_line(TOKEN_PROMPT)
         if entry:
             return token_from_entry(entry)
         print("stoken-tui: no token given")
