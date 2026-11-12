@@ -1025,10 +1025,10 @@ def _():
     accounts_to_clean.add("sigkip")
     if os.path.exists(kiplog):
         os.unlink(kiplog)
+    link_file = os.path.join(work, "sigkip-link.txt")
+    open(link_file, "w").write(kip_link() + "\n")
     p = subprocess.Popen([sys.executable, "-I", TOOL, "add", "sigkip", "--token", "-"], env=dict(env, **kip_env("sleep_after_template")),
-                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    p.stdin.write(kip_link() + "\n")
-    p.stdin.close()
+                         stdin=open(link_file), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     deadline = time.time() + 30
     while "template_written" not in kip_log() and time.time() < deadline:
         time.sleep(0.1)
