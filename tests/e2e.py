@@ -94,15 +94,15 @@ def keychain_del(account, pin=False):
     return sh("/usr/bin/security", "delete-generic-password", "-s", service_of(pin), "-a", account)[0] == 0
 
 
-def pinless_fixture(name, seed_byte):
+def pinless_fixture(name, seed_byte, serial=None):
     seed = base64.b64encode(bytes([seed_byte]) * 16).decode()
     tmpl = os.path.join(work, name + ".xml")
     with open(tmpl, "w") as f:
         f.write('<?xml version="1.0" encoding="UTF-8"?>\n<TKNBatch>\n<TKNHeader><Origin>E2E</Origin>'
                 '<DefPinType>0</DefPinType><DefLocalPIN>0</DefLocalPIN><DefAddPIN>0</DefAddPIN>'
                 '<DefDigits>6</DefDigits><DefInterval>60</DefInterval></TKNHeader>\n'
-                '<TKN><SN>00000000%04d</SN><UserLogin>e2e</UserLogin><Death>2035/12/31</Death>'
-                '<Seed>=%s</Seed></TKN>\n</TKNBatch>\n' % (seed_byte, seed))
+                '<TKN><SN>%s</SN><UserLogin>e2e</UserLogin><Death>2035/12/31</Death>'
+                '<Seed>=%s</Seed></TKN>\n</TKNBatch>\n' % (serial or "00000000%04d" % seed_byte, seed))
     path = os.path.join(work, name + ".sdtid")
     with open(path, "w") as out:
         subprocess.run([REAL_STOKEN, "export", "--random", "--sdtid", "--template", tmpl], stdout=out, check=True,
@@ -759,6 +759,511 @@ def _():
     check(os.path.join(live_dir, "index") in footer, "footer lacks the index path: %r" % footer)
     check("rename: stoken-tui rename" in footer, "footer lacks the rename hint: %r" % footer)
     check(shown.splitlines()[-2].strip().startswith("↑↓"), "key hints lost")
+
+
+# CT-KIP provisioning and the add flow ---------------------------------------------------------------
+# A stand-in for the rsa_ct_kip package: same entry point (client.main), same prints and the same template
+# (with the DefAddPin typo). It never touches a network. The fake interpreter logs its argv and puts the
+# fake package on PYTHONPATH, because the tool starts the helper as `python -I -c STUB`.
+
+KIP_CODE = "492817305516"
+KIP_URL = "https://kip.example.test/ctkip/services/CtkipService"
+KIP_SEED = bytes([0x33]) * 16
+KIP_TEMPLATE = ('<?xml version="1.0" encoding="UTF-8"?>\n<TKNBatch>\n<TKNHeader><Origin>kip.example.test</Origin>'
+                '<DefPinType>0</DefPinType><DefAddPin>%d</DefAddPin><DefDigits>6</DefDigits><DefInterval>60</DefInterval>'
+                '</TKNHeader>\n<TKN><SN>000000009901</SN><UserLogin>e2e</UserLogin><Death>2035/12/31</Death>'
+                '<Seed>=%s</Seed></TKN>\n</TKNBatch>\n')
+FAKE_CLIENT = r'''
+import base64, os, shutil, sys, time
+import requests
+stoken = shutil.which("stoken")
+SEED = bytes([0x33]) * 16
+''' + "TEMPLATE = %r\n" % KIP_TEMPLATE + r'''
+
+
+def log(line):
+    with open(os.environ["FAKE_KIP_LOG"], "a") as f:
+        f.write(line + "\n")
+
+
+def main(args=None):
+    url, code, filename = args
+    mode = os.environ.get("FAKE_KIP_MODE", "ok")
+    out = open(filename, "w")
+    log("pid=%d" % os.getpid())
+    log("url=" + url)
+    log("code=" + code)
+    if stoken:
+        raise AssertionError("the stub left stoken enabled")
+    log("connection=%s" % requests.session().headers.get("Connection"))
+    print("Sending ClientHello request to server...")
+    if mode == "fault1":
+        raise RuntimeError("soap fault, activation code %s refused" % code)
+    print("Received ServerHello response with server nonce (R_S = 00) and 2048-bit RSA public key")
+    print("Sending ServerFinished request to server, with encrypted client nonce...")
+    if mode == "fault2":
+        raise RuntimeError(("Server.Error", "token request failed for code " + code))
+    if mode == "hang":
+        time.sleep(120)
+    print("ERROR: MAC not verified! Expected 00 but server sent 11." if mode == "mac_bad" else "MAC verified (00)")
+    print("Received ServerFinished response with token information:")
+    print("  Token seed: " + SEED.hex())
+    sys.stdout.flush()
+    if mode == "crash_after_seed":
+        raise TypeError("'NoneType' object is not subscriptable")
+    out.write(TEMPLATE % (1 if mode == "pin" else 0, base64.b64encode(SEED).decode()))
+    out.flush()
+    if mode == "sleep_after_template":
+        log("template_written")
+        time.sleep(120)
+    out.close()
+    print("Saved template to " + filename)
+'''
+FAKE_REQUESTS = ('class _Session:\n    def __init__(self):\n        self.headers = {}\n        self.verify = True\n\n\n'
+                 'def session():\n    return _Session()\n')
+
+kipdir = os.path.join(work, "fakekip")
+kipcache = os.path.join(work, "kipcache")
+kiplog = os.path.join(work, "kip.log")
+os.makedirs(os.path.join(kipdir, "pkg", "rsa_ct_kip"))
+for rel, body in (("pkg/rsa_ct_kip/__init__.py", ""), ("pkg/rsa_ct_kip/client.py", FAKE_CLIENT), ("pkg/requests.py", FAKE_REQUESTS)):
+    open(os.path.join(kipdir, rel), "w").write(body)
+open(os.path.join(kipdir, "fakepy"), "w").write(
+    '#!/bin/bash\n{ printf "fakepy"; for a in "$@"; do printf " [%%s]" "$a"; done; echo; } >> "$SHIM_LOG"\n'
+    'args=(); for a in "$@"; do [ "$a" = "-I" ] || args+=("$a"); done\n'
+    'PYTHONPATH=%s exec %s "${args[@]}"\n' % (os.path.join(kipdir, "pkg"), sys.executable))
+open(os.path.join(kipdir, "rsa_ct_kip"), "w").write("#!%s\n" % os.path.join(kipdir, "fakepy"))
+for name in ("fakepy", "rsa_ct_kip"):
+    os.chmod(os.path.join(kipdir, name), 0o755)
+
+fx_kip = pinless_fixture("kip", 0x33, serial="000000009901")
+exp_kip = at(fx_kip, T)
+ctf_kip = sh(REAL_STOKEN, "export", "--file=" + fx_kip)[1]
+secrets_seen.extend([KIP_CODE, KIP_SEED.hex(), ctf_kip, base64.b64encode(KIP_SEED).decode()])
+kip_outputs = []
+
+
+def kip_link(code=KIP_CODE, url=KIP_URL):
+    return "com.rsa.securid://ctkip?url=%s&activationCode=%s" % (url, code)
+
+
+def kip_env(mode="ok", **more):
+    return dict({"STOKEN_TUI_CTKIP": os.path.join(kipdir, "rsa_ct_kip"), "STOKEN_TUI_CACHE": kipcache,
+                 "FAKE_KIP_MODE": mode, "FAKE_KIP_LOG": kiplog}, **more)
+
+
+def kip_add(alias, link=None, mode="ok", **more):
+    accounts_to_clean.add(alias)
+    if os.path.exists(kiplog):
+        os.unlink(kiplog)
+    rc, out, err = run("add", alias, "--token", "-", stdin=(link or kip_link()) + "\n", extra_env=kip_env(mode, **more))
+    kip_outputs.append(out + err)
+    return rc, out, err
+
+
+def kip_log():
+    return open(kiplog).read() if os.path.exists(kiplog) else ""
+
+
+kip_detail = []
+
+
+def kip_stored_ok(alias, token_dir=None):
+    rc, out, err = run("code", alias, "--use-time", str(T), extra_env={"STOKEN_TUI_DIR": token_dir} if token_dir else None)
+    kip_detail[:] = [rc, out.strip(), err.strip(), exp_kip]
+    return rc == 0 and out.strip() == exp_kip
+
+
+def kip_dirs():
+    return sorted(d for d in os.listdir(kipcache) if d.startswith("ctkip-")) if os.path.isdir(kipcache) else []
+
+
+def kept_path(text):
+    m = re.search(r"(/\S*ctkip-\w+)", text)
+    check(m is not None, "no kept directory named in: %r" % text)
+    return m.group(1)
+
+
+def stored(alias):
+    return alias in index_names() or keychain_get(alias) is not None
+
+
+@scenario("S35 add from a CT-KIP link: provisioned, stored like any token, code right, private directory gone")
+def _():
+    rc, out, err = kip_add("kip1")
+    check(rc == 0, "add exit %d: %s" % (rc, err))
+    check(kip_stored_ok("kip1"), "the stored seed does not give the issued token's code: %r" % kip_detail)
+    check("kip1" in index_names(), "no index entry")
+    rc, out, err = run("code", "kip1", "--use-time", str(T))
+    check(rc == 0 and out.strip() == exp_kip, "code %r != %r" % (out.strip(), exp_kip))
+    check(not kip_dirs(), "private directory left behind: %r" % kip_dirs())
+    log_text = kip_log()
+    check("connection=close" in log_text, "requests were not forced to Connection: close: %r" % log_text)
+    check("code=" + KIP_CODE in log_text and "url=" + KIP_URL in log_text, "the helper never got the code on stdin: %r" % log_text)
+
+
+@scenario("S36 a token the server marked PINless needs no PIN; one marked PIN-bearing still asks for it")
+def _():
+    rc, _, err = run("code", "kip1", "--use-time", str(T))
+    check(rc == 0, "the PINless token failed: " + err)
+    rc, _, err = kip_add("kippin", mode="pin")
+    check(rc == 0, "add of the PIN-bearing token failed: " + err)
+    rc, out, err = run("code", "kippin", "--use-time", str(T))
+    check(rc != 0 and "PIN required" in out + err, "PIN token did not ask for a PIN: %r %r" % (out, err))
+
+
+@scenario("S37 hostile or malformed links never reach the helper; a CTF link still goes to stoken")
+def _():
+    host = "kip.example.test"
+    bad = {
+        "http url": kip_link(url="http://%s/x" % host),
+        "user info": kip_link(url="https://user:pw@%s/x" % host),
+        "empty host": kip_link(url="https://"),
+        "space in url": kip_link(url="https://%s/a b" % host),
+        "dash code": kip_link(code="-492817305516"),
+        "space in code": kip_link(code="4928 17305516"),
+        "short code": kip_link(code="12"),
+        "no code": "com.rsa.securid://ctkip?url=https://%s/x" % host,
+        "no url": "com.rsa.securid://ctkip?activationCode=" + KIP_CODE,
+        "newline": kip_link() + "\nextra",
+    }
+    for label, link in bad.items():
+        rc, out, err = kip_add("hostile", link=link)
+        check(rc == 1, "%s: exit %d, want 1 (%s)" % (label, rc, err))
+        check(not kip_log() and not stored("hostile"), "%s: the helper ran or something was stored" % label)
+    rc, _, err = kip_add("encoded", link=kip_link(url=KIP_URL.replace(":", "%3A").replace("/", "%2F")))
+    check(rc == 0 and "url=" + KIP_URL in kip_log(), "a percent-encoded url was not decoded: %s %r" % (err, kip_log()))
+    os.unlink(kiplog) if os.path.exists(kiplog) else None
+    rc, _, err = run("add", "ctfok", "--token", "-", stdin=ctf_a + "\n", extra_env=kip_env())
+    accounts_to_clean.add("ctfok")
+    check(rc == 0 and keychain_get("ctfok") == ctf_a and not kip_log(), "a plain seed was not handed to stoken: " + err)
+
+
+@scenario("S38 a taken alias is refused before the code is spent, for the index and for an orphan Keychain item")
+def _():
+    rc, _, err = kip_add("alpha")
+    check(rc == 1 and not kip_log(), "alpha was provisioned over an existing alias: %s" % err)
+    keychain_set("orphkip", "orphan-seed")
+    rc, _, err = kip_add("orphkip")
+    check(rc == 1 and not kip_log(), "an orphan item did not stop the helper: %s" % err)
+    check(keychain_get("orphkip") == "orphan-seed", "the orphan item was touched")
+    rc, _, err = kip_add("fresh38")
+    check(rc == 0 and "code=" + KIP_CODE in kip_log(), "a free alias did not reach the helper, so the refusals above prove nothing: %s" % err)
+
+
+@scenario("S39 no usable rsa_ct_kip: exit 2 with a hint, nothing stored; PATH lookup works when the variable is unset")
+def _():
+    sh_script = os.path.join(work, "sh-trampoline")
+    env_script = os.path.join(work, "env-python")
+    open(sh_script, "w").write("#!/bin/sh\nexit 0\n")
+    open(env_script, "w").write("#!/usr/bin/env python3\n")
+    for p in (sh_script, env_script):
+        os.chmod(p, 0o755)
+    for label, helper in (("missing", os.path.join(work, "nope")), ("sh", sh_script), ("env", env_script), ("not set", "")):
+        rc, out, err = kip_add("nohelper", STOKEN_TUI_CTKIP=helper)
+        check(rc == 2 and "STOKEN_TUI_CTKIP" in err, "%s: exit %d, hint missing: %r" % (label, rc, err))
+        check(not kip_log() and not stored("nohelper"), "%s: helper ran or something was stored" % label)
+    rc, _, err = kip_add("viapath", STOKEN_TUI_CTKIP="", PATH=kipdir + os.pathsep + env["PATH"])
+    check(rc == 0 and kip_stored_ok("viapath"), "lookup through PATH failed: %s" % err)
+
+
+@scenario("S40 a server fault before the commit: scrubbed message, phase named, nothing left")
+def _():
+    rc, out, err = kip_add("fault", mode="fault1")
+    check(rc == 1 and not stored("fault"), "exit %d or something stored" % rc)
+    check(KIP_CODE not in out + err and "***" in err, "the activation code was not scrubbed: %r" % err)
+    check("unspent" in err, "pre-commit failure should say the code is probably unspent: %r" % err)
+    check(not kip_dirs(), "files left after a failure before the commit: %r" % kip_dirs())
+    rc, out, err = kip_add("fault", mode="fault2")
+    check(rc == 1 and KIP_CODE not in out + err and "may already be spent" in err, "second-POST failure message: %r" % err)
+    check(not kip_dirs() and not stored("fault"), "leftovers after a second-POST failure")
+
+
+@scenario("S41 a MAC that does not verify is refused even though the client exits 0")
+def _():
+    rc, out, err = kip_add("macbad", mode="mac_bad")
+    check(rc == 1 and "MAC" in err and not stored("macbad"), "exit %d, err %r" % (rc, err))
+    check(not kip_dirs(), "files kept for a token that failed its MAC: %r" % kip_dirs())
+
+
+@scenario("S42 a hung helper is killed with its children at the timeout")
+def _():
+    t0 = time.time()
+    rc, out, err = kip_add("hang", mode="hang", STOKEN_TUI_CTKIP_TIMEOUT="2")
+    check(rc == 1 and "timed out" in err and time.time() - t0 < 20, "exit %d after %.1fs: %r" % (rc, time.time() - t0, err))
+    pid = int(re.search(r"pid=(\d+)", kip_log()).group(1))
+    time.sleep(0.5)
+    try:
+        os.kill(pid, 0)
+        alive = True
+    except ProcessLookupError:
+        alive = False
+    check(not alive, "the helper process %d is still running" % pid)
+    check(not kip_dirs() and not stored("hang"), "leftovers after a timeout")
+
+
+@scenario("S43 a Keychain failure after the commit keeps recovery.sdtid, rolls back, and the file re-adds")
+def _():
+    rc, out, err = kip_add("recov", SHIM_SECURITY_DROP_WRITES="1")
+    check(rc == 1 and not stored("recov"), "exit %d, stored %s" % (rc, stored("recov")))
+    where = kept_path(err)
+    check(os.path.isdir(where) and "recovery.sdtid" in os.listdir(where), "no recovery file in %s" % where)
+    check(stat.S_IMODE(os.stat(where).st_mode) == 0o700, "kept directory is not 0700")
+    recovery = os.path.join(where, "recovery.sdtid")
+    check(stat.S_IMODE(os.stat(recovery).st_mode) == 0o600, "recovery file is not 0600")
+    check(KIP_SEED.hex() not in out + err, "the seed was printed")
+    rc, _, err = run("add", "recov", "--file", recovery)
+    check(rc == 0 and kip_stored_ok("recov"), "the recovery file did not re-add: %s" % err)
+    rc, out, _ = run("code", "recov", "--use-time", str(T))
+    check(out.strip() == exp_kip, "recovered token gives %r" % out.strip())
+    shutil.rmtree(where)
+
+
+@scenario("S44 SIGTERM while the helper holds a written template: helper killed, recovery file kept and usable")
+def _():
+    import signal
+    accounts_to_clean.add("sigkip")
+    if os.path.exists(kiplog):
+        os.unlink(kiplog)
+    p = subprocess.Popen([sys.executable, "-I", TOOL, "add", "sigkip", "--token", "-"], env=dict(env, **kip_env("sleep_after_template")),
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    p.stdin.write(kip_link() + "\n")
+    p.stdin.close()
+    deadline = time.time() + 30
+    while "template_written" not in kip_log() and time.time() < deadline:
+        time.sleep(0.1)
+    check("template_written" in kip_log(), "the helper never wrote its template: %r" % kip_log())
+    p.send_signal(signal.SIGTERM)
+    out, err = p.communicate(timeout=30)
+    pid = int(re.search(r"pid=(\d+)", kip_log()).group(1))
+    time.sleep(0.5)
+    try:
+        os.kill(pid, 0)
+        alive = True
+    except ProcessLookupError:
+        alive = False
+    check(not alive, "the helper process %d outlived the tool" % pid)
+    where = kept_path(err)
+    recovery = os.path.join(where, "recovery.sdtid")
+    check(os.path.isfile(recovery), "no recovery file after SIGTERM: %r %r" % (os.listdir(where), err))
+    check(not stored("sigkip"), "a half-added alias was left")
+    rc, _, err = run("add", "sigkip", "--file", recovery)
+    check(rc == 0 and kip_stored_ok("sigkip"), "the recovery file did not re-add: %s" % err)
+    shutil.rmtree(where)
+
+
+@scenario("S45 the activation code and the seed never reach any argv, any output stream or any file outside a kept directory")
+def _():
+    calls = open(shimlog).read()
+    check("fakepy [" in calls, "the fake interpreter never logged, so the check proves nothing")
+    for secret in (KIP_CODE, KIP_SEED.hex(), ctf_kip, base64.b64encode(KIP_SEED).decode()):
+        check(secret not in calls, "%r... found in a logged argv" % secret[:4])
+        check(not any(secret in text for text in kip_outputs), "%r... found in tool output" % secret[:4])
+    for root, _, files in os.walk(tokdir):
+        for name in files:
+            check(KIP_CODE not in open(os.path.join(root, name), errors="replace").read(), "code found in %s" % name)
+    check(not kip_dirs(), "kept directories remain after the suite: %r" % kip_dirs())
+
+
+class Pane:
+    """A program in a private tmux server, driven with keystrokes and read back from the screen."""
+    counter = 0
+
+    def __init__(self, args, token_dir, cols=100, lines=30, keep_pin_env=False):
+        import shlex
+        Pane.counter += 1
+        self.sock, self.name = "stoken-tui-e2e-p%d-%d" % (os.getpid(), Pane.counter), "pane"
+        self.tm = ["tmux", "-L", self.sock]
+        settings = ["STOKEN_TUI_DIR=" + token_dir, "STOKEN_TUI_SERVICE=" + service, "STOKEN_TUI_AUTH=/usr/bin/true",
+                    "STOKEN_TUI_SECURITY=" + env["STOKEN_TUI_SECURITY"], "PATH=" + env["PATH"], "SHIM_LOG=" + shimlog,
+                    "SHIM_CLIP=" + env["SHIM_CLIP"], "LANG=en_US.UTF-8"]
+        settings += ["%s=%s" % kv for kv in kip_env().items()]
+        inner = shlex.join(["env", *settings, sys.executable, "-I", TOOL, *args]) + "; echo __EXIT__$?; sleep 120"
+        subprocess.run(self.tm + ["new-session", "-d", "-s", self.name, "-x", str(cols), "-y", str(lines), "/bin/sh", "-c", inner], check=True)
+
+    def screen(self):
+        return subprocess.run(self.tm + ["capture-pane", "-p", "-t", self.name], capture_output=True, text=True).stdout
+
+    def expect(self, text, timeout=25, count=1):
+        end = time.time() + timeout
+        while time.time() < end:
+            shown = self.screen()
+            if shown.count(text) >= count:
+                return shown
+            time.sleep(0.2)
+        raise AssertionError("never saw %r on the screen:\n%s" % (text, self.screen()))
+
+    def expect_code(self, timeout=25):
+        end = time.time() + timeout
+        while time.time() < end:
+            shown = self.screen()
+            if re.search(r"\d{3} \d{3}", shown):
+                return shown
+            time.sleep(0.2)
+        raise AssertionError("no code ever appeared:\n" + self.screen())
+
+    def send(self, text):
+        if text:
+            subprocess.run(self.tm + ["send-keys", "-t", self.name, "-l", text], check=True)
+        subprocess.run(self.tm + ["send-keys", "-t", self.name, "Enter"], check=True)
+
+    def key(self, name):
+        subprocess.run(self.tm + ["send-keys", "-t", self.name, name], check=True)
+
+    def close(self):
+        subprocess.run(self.tm + ["kill-server"], capture_output=True)
+
+
+def wizard(args, token_dir, script, **kw):
+    """Play (expected prompt, answer) pairs against `stoken-tui add ...` and return the final screen."""
+    pane = Pane(args, token_dir, **kw)
+    try:
+        for prompt, answer in script:
+            pane.expect(prompt)
+            if answer is not None:
+                pane.send(answer)
+        return pane.expect("__EXIT__")
+    finally:
+        pane.close()
+
+
+def exit_code(shown):
+    return int(re.search(r"__EXIT__(\d+)", shown).group(1))
+
+
+@scenario("S46 the add flow on a terminal: name, path or link, PIN; a CT-KIP host is confirmed before the code is spent")
+def _():
+    wdir = os.path.join(work, "wiz")
+    spaced = os.path.join(work, "my token.sdtid")
+    shutil.copy(fx_a, spaced)
+    accounts_to_clean.update(("wiz1", "wiz2", "wiz3", "wiz4"))
+    shown = wizard(["add"], wdir, [("Name", "wiz1"), ("Token", "'%s'" % spaced), ("PIN", "")])
+    check(exit_code(shown) == 0 and keychain_get("wiz1") == ctf_a, "a quoted path with a space did not work:\n" + shown)
+    shown = wizard(["add"], wdir, [("Name", "wiz4"), ("Token", spaced.replace(" ", "\\ ")), ("PIN", "")])
+    check(exit_code(shown) == 0 and keychain_get("wiz4") == ctf_a, "a backslash-escaped path did not work:\n" + shown)
+    if os.path.exists(kiplog):
+        os.unlink(kiplog)
+    shown = wizard(["add"], wdir, [("Name", "wiz2"), ("Token", kip_link()), ("PIN", ""), ("[y/N]", "y")])
+    check(exit_code(shown) == 0 and kip_stored_ok("wiz2", wdir), "CT-KIP through the flow failed:\n" + shown)
+    check("kip.example.test" in shown and "password manager" in shown, "host or the save-the-link reminder not shown:\n" + shown)
+    check("code=" + KIP_CODE in kip_log(), "the helper never ran after y")
+    os.unlink(kiplog)
+    shown = wizard(["add"], wdir, [("Name", "wiz3"), ("Token", kip_link()), ("PIN", ""), ("[y/N]", "n")])
+    check(exit_code(shown) == 1 and not kip_log() and not stored("wiz3"), "declining still spent the code or stored a token:\n" + shown)
+
+
+@scenario("S47 the add flow off a terminal, or half-filled: exit 2 with usage and nothing stored; a given name skips its prompt")
+def _():
+    rc, out, err = run("add", stdin="")
+    check(rc == 2 and "alias" in err.lower(), "bare add on a pipe: exit %d %r" % (rc, err))
+    rc, out, err = run("add", "halfway", stdin="")
+    check(rc == 2 and not stored("halfway"), "add NAME on a pipe: exit %d %r" % (rc, err))
+    pane = Pane(["add", "wiz5"], os.path.join(work, "wiz"))
+    try:
+        shown = pane.expect("Token (paste")
+        check("Name for this token" not in shown, "a given name was asked for again:\n" + shown)
+    finally:
+        pane.close()
+
+
+@scenario("S48 bad input to the flow: bad and taken names are re-asked, an empty token too, Ctrl-C leaves nothing")
+def _():
+    accounts_to_clean.add("wiz6")
+    pane = Pane(["add"], os.path.join(work, "wiz48"))
+    try:
+        pane.expect("Name for this token")
+        pane.send("../evil")
+        pane.expect("alias must match")
+        pane.expect("Name for this token", count=2)
+        pane.send("alpha")
+        pane.expect("already exists")
+        pane.expect("Name for this token", count=3)
+        pane.send("wiz6")
+        pane.expect("Token (paste")
+        pane.send("")
+        pane.expect("no token given")
+        pane.expect("Token (paste", count=2)
+        pane.key("C-c")
+        shown = pane.expect("__EXIT__")
+        check(exit_code(shown) == 130 and "cancelled" in shown, "Ctrl-C at the token prompt:\n" + shown)
+    finally:
+        pane.close()
+    check(not stored("wiz6") and "wiz6" not in open(os.path.join(work, "wiz48", "index")).read() if os.path.exists(os.path.join(work, "wiz48", "index")) else not stored("wiz6"), "a half-written alias was left")
+
+
+@scenario("S49 a in the live view runs the flow and returns to the view; Ctrl-C returns too; the footer lists a")
+def _():
+    vdir = os.path.join(work, "view49")
+    for alias in ("tuia", "wiza"):
+        keychain_del(alias)
+        accounts_to_clean.add(alias)
+    rc, _, err = run("add", "tuia", "--file", fx_a, extra_env={"STOKEN_TUI_DIR": vdir})
+    check(rc == 0, "add tuia: " + err)
+    pane = Pane([], vdir)
+    try:
+        pane.expect("tuia")
+        pane.expect_code()
+        pane.key("Enter")
+        pane.expect("copied")
+        pane.key("a")
+        pane.expect("Name for this token")
+        check(open(env["SHIM_CLIP"]).read() == "", "the copied code was still on the clipboard while the flow ran")
+        pane.send("wiza")
+        pane.expect("Token (paste")
+        pane.send(fx_b)
+        pane.expect("PIN (Enter")
+        pane.send("")
+        shown = pane.expect("2 tokens")
+        check("wiza" in shown, "the new token is missing from the view:\n" + shown)
+        pane.expect("a add")
+        pane.key("a")
+        pane.expect("Name for this token")
+        pane.key("C-c")
+        pane.expect("Press Enter")
+        pane.key("Enter")
+        shown = pane.expect("2 tokens")
+        check("▌" in shown, "the view did not come back after Ctrl-C:\n" + shown)
+        pane.key("q")
+        shown = pane.expect("__EXIT__")
+        check(exit_code(shown) == 0 and "▌" not in shown, "the view did not restore the screen on quit:\n" + shown)
+    finally:
+        pane.close()
+    check(keychain_get("wiza") == ctf_b, "wiza was not stored")
+
+
+@scenario("S50 a helper crash after the commit keeps its captured output in a 0600 file and says the code is spent")
+def _():
+    rc, out, err = kip_add("crash", mode="crash_after_seed")
+    check(rc == 1 and not stored("crash"), "exit %d" % rc)
+    where = kept_path(err)
+    files = os.listdir(where)
+    check(len(files) == 1 and "spent" in err, "kept %r, message %r" % (files, err))
+    kept = os.path.join(where, files[0])
+    check(stat.S_IMODE(os.stat(kept).st_mode) == 0o600 and KIP_SEED.hex() in open(kept).read(), "the seed is not in the kept file")
+    check(KIP_SEED.hex() not in out + err, "the seed was printed")
+    shutil.rmtree(where)
+
+
+@scenario("S51 no tokens on a terminal: the view opens with an empty state, and a adds the first token")
+def _():
+    accounts_to_clean.add("first")
+    pane = Pane([], os.path.join(work, "empty51"))
+    try:
+        shown = pane.expect("No tokens yet")
+        check("Press a" in shown, "the empty state does not mention a:\n" + shown)
+        pane.key("a")
+        pane.expect("Name for this token")
+        pane.send("first")
+        pane.expect("Token (paste")
+        pane.send(fx_a)
+        pane.expect("PIN (Enter")
+        pane.send("")
+        shown = pane.expect("1 token")
+        check("first" in shown, "the new row did not appear:\n" + shown)
+        pane.key("q")
+        check(exit_code(pane.expect("__EXIT__")) == 0, "quit failed")
+    finally:
+        pane.close()
 
 
 for acct in list(accounts_to_clean):
