@@ -72,6 +72,7 @@ Rows marked "probed" were measured against stoken 0.93 and macOS 27.2's `securit
 | The helper gets 60 s (`STOKEN_TUI_CTKIP_TIMEOUT`). A timeout or a signal kills its process group, then follows the same keep-or-delete rule. | A hung server must not hang the terminal or leave a child holding the code. |
 | `add` takes an optional alias and an optional source. A missing one is asked for: the name, then the token (the prompt shows what you type; it accepts a CT-KIP link, a CTF string or link, or the path of an `.sdtid` file, with quotes and `\ ` unescaped), then the PIN. Off a terminal, it exits 2. For a CT-KIP link the wizard names the host, says the code works once and that the link belongs in a password manager first, and asks `[y/N]` before spending the code. Piped input does not ask. | A drag-and-drop path or a pasted link both work, and a phishing host is visible before the code is used. |
 | `a` in the live view clears a copied code from the clipboard, leaves the alternate screen, restores the terminal, runs the same flow, waits for Enter after an error or a cancel, puts the view back and reloads the rows. A failed or cancelled add returns to the view. | One flow, two entry points. The 30 s clipboard clear cannot fire while a prompt blocks. |
+| `r` in the live view does the same suspend and restore around one prompt, "New name for X", which re-asks a bad or taken name up to three times, then runs the same rename as `rename OLD NEW` (one function, so the rollback is shared). The renamed row stays selected. It does nothing when there are no tokens. | Renaming from the screen where the name is read removes the trip to a second command. The index moves the renamed alias to the end, so the selection follows the name, not the position. |
 | With no tokens on a terminal, the live view opens with an empty state ("No tokens yet. Press a to add one.") instead of exiting. Off a terminal, the frame still prints `EMPTY_HINT`. | A first-time user otherwise never reaches a screen where `a` works. |
 
 ## Interface
@@ -88,7 +89,7 @@ Rows marked "probed" were measured against stoken 0.93 and macOS 27.2's `securit
                 STOKEN_TUI_PASSWORD, STOKEN_TUI_PIN, STOKEN_TUI_ASCII, STOKEN_TUI_CTKIP,
                 STOKEN_TUI_CTKIP_TIMEOUT
 
-Live view keys: up/down or j/k select, Enter or c copy the code with `pbcopy`, n copy the next code, a add a token, q quit.
+Live view keys: up/down or j/k select, Enter or c copy the code with `pbcopy`, n copy the next code, a add a token, r rename the selected token, q quit.
 
 A card shows the alias, the grouped code with a countdown bar and the seconds, and the next code in dim text under it. A failed token shows `! no seed in Keychain` (or the cause) in place of the code. The footer has two lines: the keys, and where the alias list lives with the `rename` hint.
 
@@ -147,6 +148,7 @@ Each row is one scenario in `tests/e2e.py`.
 | S47 wizard off a terminal, or half-filled | `add` with no terminal exits 2; `add NAME` with no source asks for the token | The wizard hangs on a pipe | Exit 2 with usage; nothing stored |
 | S48 wizard bad input | Re-ask a bad or taken name; refuse an empty token; Ctrl-C leaves nothing | A half-written alias | Nothing stored on any of them |
 | S49 `a` in the live view | Suspend the view, run the flow, reload the rows | The terminal is left raw, the new token is missing, or a cancel quits the view | The new alias shows with a code, `q` restores the terminal, the footer lists `a`, and Ctrl-C at a prompt returns to the view |
+| S55 `r` in the live view | Suspend the view, ask for a new name, rename with rollback, reload the rows | A taken or bad name is accepted, Ctrl-C changes something or quits the view, the old Keychain items remain, the PIN is left behind, or the selection jumps to another token | An empty view ignores `r`; Ctrl-C returns with nothing changed; `renb` (taken) and `../evil` are re-asked; `renc` moves seed and PIN, drops the old items, and Enter copies `renc` |
 | S50 helper crashes after the commit | Keep the captured stdout in a 0600 file in the kept directory | The seed exists only on stdout | Exit 1 naming the kept file; nothing is stored; the message says the code is spent |
 | S52 helper crash that leaves a partial template | Keep the captured stdout whenever no `recovery.sdtid` exists, whatever the template holds | The stdout fallback is gated on an empty template, so a broken one loses the seed | Exit 1 naming the folder; `helper-output.txt` (0600) holds the seed line; nothing is stored |
 | S53 alias with spaces | Accept inner spaces everywhere a name goes: add, code, frame, rename, export, rm (`name.trashed-<epoch>`) and the wizard | A space at either end, a tab, a quote or a backslash reaches the `security -i` line | Edge spaces and the other characters are refused with exit 2 before any write (S5); inner spaces work end to end |

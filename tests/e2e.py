@@ -1305,6 +1305,63 @@ def _():
         pane.close()
 
 
+@scenario("S55 r in the live view renames the selected token: an empty view ignores it, Ctrl-C leaves it alone, taken and bad names are re-asked, the new row stays selected")
+def _():
+    for alias in ("rena", "renb", "renc"):
+        keychain_del(alias)
+        keychain_del(alias, pin=True)
+        accounts_to_clean.add(alias)
+    empty = Pane([], os.path.join(work, "view55-empty"))
+    try:
+        empty.expect("No tokens yet")
+        empty.key("r")
+        time.sleep(1)
+        check("New name" not in empty.screen(), "r on an empty view opened a prompt:\n" + empty.screen())
+        empty.key("q")
+        check(exit_code(empty.expect("__EXIT__")) == 0, "r on an empty view broke the view:\n" + empty.screen())
+    finally:
+        empty.close()
+    vdir = os.path.join(work, "view55")
+    rc, _, err = run("add", "rena", "--token", "-", stdin=pin_tok + "\n", extra_env={"STOKEN_TUI_DIR": vdir, "STOKEN_TUI_PIN": PIN})
+    check(rc == 0, "add rena: " + err)
+    rc, _, err = run("add", "renb", "--file", fx_b, extra_env={"STOKEN_TUI_DIR": vdir})
+    check(rc == 0, "add renb: " + err)
+    pane = Pane([], vdir)
+    try:
+        pane.expect("r rename")
+        pane.expect_code()
+        pane.key("Enter")
+        pane.expect("copied rena")
+        pane.key("r")
+        pane.expect("New name for rena")
+        check(open(env["SHIM_CLIP"]).read() == "", "the copied code was still on the clipboard while the prompt ran")
+        pane.key("C-c")
+        pane.expect("Press Enter")
+        pane.key("Enter")
+        pane.expect("2 tokens")
+        check(keychain_get("rena") == ctf_pin and keychain_get("renc") is None, "Ctrl-C changed something")
+        pane.key("r")
+        pane.expect("New name for rena")
+        pane.send("renb")
+        pane.expect("New name for rena", count=2)
+        pane.send("../evil")
+        pane.expect("New name for rena", count=3)
+        pane.send("renc")
+        pane.expect("renamed rena to renc")
+        end = time.time() + 15
+        while "copied" not in pane.screen() and time.time() < end:
+            pane.key("Enter")
+            time.sleep(0.5)
+        check("copied renc" in pane.screen(), "Enter did not copy the renamed token:\n" + pane.screen())
+        pane.key("q")
+        check(exit_code(pane.expect("__EXIT__")) == 0, "quit failed")
+    finally:
+        pane.close()
+    check(keychain_get("rena") is None and keychain_get("rena", pin=True) is None, "the old Keychain items remain")
+    check(keychain_get("renc") == ctf_pin and keychain_get("renc", pin=True) == PIN, "seed or PIN did not move")
+    check("renc" in open(os.path.join(vdir, "index")).read().split("\n") and "rena" not in open(os.path.join(vdir, "index")).read().split("\n"), "index not updated")
+
+
 def type_without_enter(pane, text):
     subprocess.run(pane.tm + ["send-keys", "-t", pane.name, "-l", text], check=True)
 

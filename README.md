@@ -84,13 +84,13 @@ stoken-tui code work --next
 | Add a token from a link or CTF string | `pbpaste \| stoken-tui add NAME --token -` |
 | Move in a token that stoken already holds | `stoken-tui adopt NAME ~/.stokenrc` |
 | Print one code | `stoken-tui code NAME` (`--next` for the next one) |
-| Rename a token | `stoken-tui rename OLD NEW` |
+| Rename a token | `stoken-tui rename OLD NEW`, or `r` in the live view |
 | Print the stored seed | `stoken-tui export NAME` |
 | Remove a token | `stoken-tui rm NAME` (`--purge` also deletes its seed) |
 
 `add` asks for whatever you left out: the name, then the token (shown as you type; paste a link or a CTF string, or drop in the path of an `.sdtid` file), then the PIN. Names may hold spaces (`my vpn`) and 64 characters at most. Press Enter at the PIN if the token has none. `adopt` asks for a PIN too.
 
-Don't edit the name list by hand. The footer shows where it lives (`~/.stoken/index`), but each name is also the Keychain account that holds the seed, so changing one without the other loses the token. `rename` changes both.
+Don't edit the name list by hand. The footer shows where it lives (`~/.stoken/index`), but each name is also the Keychain account that holds the seed, so changing one without the other loses the token. `rename` (and `r` in the live view, which asks for the new name and runs the same code) changes both.
 
 ## Touch ID
 

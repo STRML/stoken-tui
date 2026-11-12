@@ -550,11 +550,11 @@ BAR_MAX = 32
 SGR = {"bold": "1", "dim": "2", "red": "31", "green": "32", "yellow": "33", "cyan": "36"}
 KEY_TOKENS = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z~]|\x1bO[A-Za-z]|\x1b|.", re.S)
 KEY_NAMES = {b"\x1b[A": "up", b"\x1bOA": "up", b"k": "up", b"\x1b[B": "down", b"\x1bOB": "down", b"j": "down",
-             b"c": "copy", b"\r": "copy", b"\n": "copy", b"n": "next", b"a": "add", b"q": "quit", b"\x1b": "quit", b"\x03": "quit"}
+             b"c": "copy", b"\r": "copy", b"\n": "copy", b"n": "next", b"a": "add", b"r": "rename", b"q": "quit", b"\x1b": "quit", b"\x03": "quit"}
 UNICODE_GLYPHS = {"marker": "▌", "full": "━", "half": "╸", "empty": "─", "rule": "─", "ok": "✓", "err": "!",
-                  "wait": "…", "hint": "↑↓ select    Enter copy    n copy next    a add    q quit"}
+                  "wait": "…", "hint": "↑↓ select    Enter copy    n copy next    a add    r rename    q quit"}
 ASCII_GLYPHS = {"marker": ">", "full": "#", "half": "#", "empty": "-", "rule": "-", "ok": "*", "err": "!",
-                "wait": "...", "hint": "up/down select    Enter copy    n copy next    a add    q quit"}
+                "wait": "...", "hint": "up/down select    Enter copy    n copy next    a add    r rename    q quit"}
 
 
 def pick_glyphs():
@@ -699,13 +699,21 @@ def clear_clipboard(code):
         subprocess.run(["pbcopy"], input="", text=True)
 
 
-def add_from_view(fd, saved):
-    """Leave the live view, run the add flow on the plain terminal, then put the view back."""
+def view_action(key, rows, selected):
+    """The flow a key runs outside the view, and the toast it earns (%s is the name the flow returns)."""
+    if key == "add":
+        return (lambda: add_flow(None, None, True)), "added %s"
+    old = rows[selected].alias
+    return (lambda: rename_flow(old)), "renamed %s to %%s" % old
+
+
+def run_outside_view(fd, saved, flow):
+    """Leave the live view, run a flow on the plain terminal, then put the view back."""
     os.write(1, b"\x1b[?25h\x1b[?1049l")
     termios.tcsetattr(fd, termios.TCSADRAIN, saved)
-    added, problem = None, None
+    result, problem = None, None
     try:
-        added = add_flow(None, None, True)
+        result = flow()
     except (Fail, KeychainUnavailable) as e:
         problem = str(e)
     except (KeyboardInterrupt, EOFError):
@@ -716,7 +724,7 @@ def add_from_view(fd, saved):
             input("Press Enter to return to the view.")
     tty.setcbreak(fd)
     os.write(1, b"\x1b[?1049h\x1b[?25l")
-    return added
+    return result
 
 
 def run_live(glyphs):
@@ -736,14 +744,15 @@ def run_live(glyphs):
             for key in parse_keys(os.read(fd, 64)) if select.select([fd], [], [], 0.25)[0] else []:
                 if key == "quit":
                     return 0
-                if key == "add":
+                if key == "add" or (key == "rename" and rows):
                     if clip:
                         clear_clipboard(clip[0])
                         clip = None
-                    added = add_from_view(fd, saved)
+                    flow, message = view_action(key, rows, selected)
+                    done = run_outside_view(fd, saved, flow)
                     rows, pending = [Row(a) for a in list_aliases()], {}
-                    selected = next((i for i, r in enumerate(rows) if r.alias == added), min(selected, max(0, len(rows) - 1)))
-                    toast = ("added %s" % added, time.time() + 2) if added else toast
+                    selected = next((i for i, r in enumerate(rows) if r.alias == done), min(selected, max(0, len(rows) - 1)))
+                    toast = (message % done, time.time() + 2) if done else toast
                     continue
                 selected = move(key, selected, len(rows))
                 if rows and key in ("copy", "next"):
@@ -892,9 +901,9 @@ def preflight_alias(alias):
         refuse_existing(alias, aliases)
 
 
-def prompt_alias():
+def prompt_alias(prompt=NAME_PROMPT):
     for _ in range(PROMPT_TRIES):
-        name = ask_line(NAME_PROMPT)
+        name = ask_line(prompt)
         try:
             check_alias(name)
             preflight_alias(name)
@@ -994,31 +1003,43 @@ def cmd_adopt(args):
     return 0
 
 
-def cmd_rename(args):
-    check_alias(args.old)
-    check_alias(args.new)
+def rename_alias(old, new):
+    """Write the seed (and PIN) under the new name, swap the index entry, then drop the old items."""
+    check_alias(old)
+    check_alias(new)
     exit_on_signal()
     with locked_index() as aliases:
-        seed, pin = kc_get(args.old), kc_get(args.old, pin=True)
-        if args.old not in aliases or seed is None:
-            raise Fail("no such alias: %s" % args.old)
-        refuse_existing(args.new, aliases)
+        seed, pin = kc_get(old), kc_get(old, pin=True)
+        if old not in aliases or seed is None:
+            raise Fail("no such alias: %s" % old)
+        refuse_existing(new, aliases)
         try:
-            kc_put(args.new, seed)
+            kc_put(new, seed)
             if pin:
-                kc_put(args.new, pin, pin=True)
-            write_index([a for a in aliases if a != args.old] + [args.new])
+                kc_put(new, pin, pin=True)
+            write_index([a for a in aliases if a != old] + [new])
         except BaseException:
             write_index(aliases)
             with contextlib.suppress(Exception):
-                kc_delete(args.new)
-                kc_delete(args.new, pin=True)
+                kc_delete(new)
+                kc_delete(new, pin=True)
             raise
         with contextlib.suppress(Exception):
-            kc_delete(args.old)
-            kc_delete(args.old, pin=True)
+            kc_delete(old)
+            kc_delete(old, pin=True)
+
+
+def cmd_rename(args):
+    rename_alias(args.old, args.new)
     print("Renamed %s to %s." % (args.old, args.new))
     return 0
+
+
+def rename_flow(old):
+    """Ask for the new name of `old`, rename it, and return the new name."""
+    new = prompt_alias("New name for %s: " % old)
+    rename_alias(old, new)
+    return new
 
 
 def cmd_rm(args):
