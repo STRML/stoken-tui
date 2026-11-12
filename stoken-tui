@@ -285,7 +285,7 @@ def find_helper():
     interpreter = found.group(1) if found else None
     if not interpreter or os.path.basename(interpreter) in NO_SHEBANG_INTERPRETERS or not os.access(interpreter, os.X_OK):
         raise Usage("cannot tell which Python runs %s (its first line must name one by absolute path): "
-                    "set STOKEN_TUI_CTKIP to a pip-installed rsa_ct_kip script" % path)
+                    "set STOKEN_TUI_CTKIP to the rsa_ct_kip script that `uv tool install rsa-ct-kip` or `pipx install rsa-ct-kip` writes" % path)
     return interpreter
 
 
