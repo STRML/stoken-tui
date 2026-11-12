@@ -811,6 +811,10 @@ def main(args=None):
     sys.stdout.flush()
     if mode == "crash_after_seed":
         raise TypeError("'NoneType' object is not subscriptable")
+    if mode == "partial_template":
+        out.write("<TKNBatch><TKN>")
+        out.flush()
+        raise TypeError("crashed mid-write")
     out.write(TEMPLATE % (1 if mode == "pin" else 0, base64.b64encode(SEED).decode()))
     out.flush()
     if mode == "sleep_after_template":
@@ -1240,6 +1244,18 @@ def _():
     check(len(files) == 1 and "spent" in err, "kept %r, message %r" % (files, err))
     kept = os.path.join(where, files[0])
     check(stat.S_IMODE(os.stat(kept).st_mode) == 0o600 and KIP_SEED.hex() in open(kept).read(), "the seed is not in the kept file")
+    check(KIP_SEED.hex() not in out + err, "the seed was printed")
+    shutil.rmtree(where)
+
+
+@scenario("S52 a crash that leaves a partial template still keeps the helper's stdout, which holds the seed")
+def _():
+    rc, out, err = kip_add("partial", mode="partial_template")
+    check(rc == 1 and not stored("partial"), "exit %d, stored %s" % (rc, stored("partial")))
+    where = kept_path(err)
+    kept = os.path.join(where, "helper-output.txt")
+    check(os.path.isfile(kept), "stdout was not kept; the folder holds %r" % os.listdir(where))
+    check(stat.S_IMODE(os.stat(kept).st_mode) == 0o600 and KIP_SEED.hex() in open(kept).read(), "the kept stdout lacks the seed or is not 0600")
     check(KIP_SEED.hex() not in out + err, "the seed was printed")
     shutil.rmtree(where)
 

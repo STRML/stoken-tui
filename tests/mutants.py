@@ -50,6 +50,8 @@ MUTANTS = [
     ("alias checked after provisioning", "        check_alias(alias)\n        preflight_alias(alias)", "        check_alias(alias)", {"S38"}),
     ("MAC ignored", 'if "MAC verified" not in result.stdout or "MAC not verified" in result.stdout:', "if False:", {"S41"}),
     ("recovery never kept", '    if not committed or "MAC not verified" in result.stdout:', "    if True:", {"S44", "S50"}),
+    ("stdout kept only for an empty template", "    if not template:\n        unlink_quiet(template_path)\n    write_private(os.path.join(workdir, OUTPUT_NAME), stdout)",
+     "    if not template:\n        unlink_quiet(template_path)\n        write_private(os.path.join(workdir, OUTPUT_NAME), stdout)", {"S52"}),
     ("recovery dropped after a Keychain failure", "    except BaseException:\n        note_kept(workdir)\n        raise",
      "    except BaseException:\n        shutil.rmtree(workdir, ignore_errors=True)\n        raise", {"S43"}),
     ("template tag not fixed", 'fixed = template.replace("DefAddPin>", "DefAddPIN>")', "fixed = template", {"S35", "S36"}),

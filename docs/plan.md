@@ -147,6 +147,7 @@ Each row is one scenario in `tests/e2e.py`.
 | S48 wizard bad input | Re-ask a bad or taken name; refuse an empty token; Ctrl-C leaves nothing | A half-written alias | Nothing stored on any of them |
 | S49 `a` in the live view | Suspend the view, run the flow, reload the rows | The terminal is left raw, the new token is missing, or a cancel quits the view | The new alias shows with a code, `q` restores the terminal, the footer lists `a`, and Ctrl-C at a prompt returns to the view |
 | S50 helper crashes after the commit | Keep the captured stdout in a 0600 file in the kept directory | The seed exists only on stdout | Exit 1 naming the kept file; nothing is stored; the message says the code is spent |
+| S52 helper crash that leaves a partial template | Keep the captured stdout whenever no `recovery.sdtid` exists, whatever the template holds | The stdout fallback is gated on an empty template, so a broken one loses the seed | Exit 1 naming the folder; `helper-output.txt` (0600) holds the seed line; nothing is stored |
 | S51 no tokens on a terminal | Open the view with an empty state; `a` works from it | The view exits before `a` can be pressed | The hint shows, `a` adds a token, and the row appears |
 | Resize, Ctrl-C, SIGTERM | The terminal size is read every tick; `finally` restores the cursor, the alternate screen and the tty modes | A killed view leaves the terminal raw | Restored on every exit path |
 

@@ -386,9 +386,10 @@ def save_recovery(workdir, template, stdout):
             write_private(recovery, sdtid_from_template(template))
     if os.path.exists(recovery):
         unlink_quiet(template_path)
-    elif not template:
+        return
+    if not template:
         unlink_quiet(template_path)
-        write_private(os.path.join(workdir, OUTPUT_NAME), stdout)
+    write_private(os.path.join(workdir, OUTPUT_NAME), stdout)
 
 
 def note_kept(workdir):
