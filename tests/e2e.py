@@ -1305,6 +1305,15 @@ def _():
         pane.close()
 
 
+def copy_selected(pane, alias):
+    """Press Enter until the selected row has a code to copy; a row's code arrives after the view draws it."""
+    end = time.time() + 15
+    while "copied" not in pane.screen() and time.time() < end:
+        pane.key("Enter")
+        time.sleep(0.5)
+    check("copied %s" % alias in pane.screen(), "Enter did not copy %s:\n%s" % (alias, pane.screen()))
+
+
 @scenario("S55 r in the live view renames the selected token: an empty view ignores it, Ctrl-C leaves it alone, taken and bad names are re-asked, the new row stays selected")
 def _():
     for alias in ("rena", "renb", "renc"):
@@ -1329,9 +1338,7 @@ def _():
     pane = Pane([], vdir)
     try:
         pane.expect("r rename")
-        pane.expect_code()
-        pane.key("Enter")
-        pane.expect("copied rena")
+        copy_selected(pane, "rena")
         pane.key("r")
         pane.expect("New name for rena")
         check(open(env["SHIM_CLIP"]).read() == "", "the copied code was still on the clipboard while the prompt ran")
@@ -1348,11 +1355,7 @@ def _():
         pane.expect("New name for rena", count=3)
         pane.send("renc")
         pane.expect("renamed rena to renc")
-        end = time.time() + 15
-        while "copied" not in pane.screen() and time.time() < end:
-            pane.key("Enter")
-            time.sleep(0.5)
-        check("copied renc" in pane.screen(), "Enter did not copy the renamed token:\n" + pane.screen())
+        copy_selected(pane, "renc")
         pane.key("q")
         check(exit_code(pane.expect("__EXIT__")) == 0, "quit failed")
     finally:
