@@ -116,7 +116,7 @@ def at(sdtid, t):
 
 def index_names():
     path = os.path.join(tokdir, "index")
-    return open(path).read().split() if os.path.exists(path) else []
+    return [n for n in open(path).read().split("\n") if n] if os.path.exists(path) else []
 
 
 def frame():
@@ -229,7 +229,7 @@ def _():
 
 @scenario("S5 hostile aliases rejected before any write")
 def _():
-    for bad in ("../evil", "a b", ".hid", "x/y", "", "a" * 65, "a\n"):
+    for bad in ("../evil", " lead", "trail ", "tab\tname", 'quo"te', "back\\slash", ".hid", "x/y", "", "a" * 65, "a\n"):
         rc, _, _ = run("add", bad, "--file", fx_a)
         check(rc != 0, "alias %r accepted" % bad)
     check(index_names() == ["alpha", "beta"], "index changed: %r" % index_names())
@@ -1258,6 +1258,28 @@ def _():
     check(stat.S_IMODE(os.stat(kept).st_mode) == 0o600 and KIP_SEED.hex() in open(kept).read(), "the kept stdout lacks the seed or is not 0600")
     check(KIP_SEED.hex() not in out + err, "the seed was printed")
     shutil.rmtree(where)
+
+
+@scenario("S53 an alias may hold spaces: add, code, frame, rename, export, rm and the wizard all take it")
+def _():
+    sdir = os.path.join(work, "spaces")
+    env_dir = {"STOKEN_TUI_DIR": sdir}
+    accounts_to_clean.update(("my vpn", "work vpn", "tv room"))
+    rc, out, err = run("add", "my vpn", "--file", fx_a, extra_env=env_dir)
+    check(rc == 0 and keychain_get("my vpn") == ctf_a, "add 'my vpn': exit %d %s" % (rc, err))
+    check(open(os.path.join(sdir, "index")).read().split("\n")[:1] == ["my vpn"], "the index does not hold the full name")
+    rc, out, err = run("code", "my vpn", "--use-time", str(T), extra_env=env_dir)
+    check(rc == 0 and out.strip() == exp_a, "code: %r %s" % (out, err))
+    rc, out, _ = run("--once", "--use-time", str(T), extra_env=env_dir)
+    check("my vpn" in out, "the frame lost the name: %r" % out)
+    rc, out, err = run("rename", "my vpn", "work vpn", extra_env=env_dir)
+    check(rc == 0 and keychain_get("work vpn") == ctf_a and keychain_get("my vpn") is None, "rename: exit %d %s" % (rc, err))
+    rc, out, err = run("export", "work vpn", extra_env=env_dir)
+    check(rc == 0 and out.strip() == ctf_a, "export: %r %s" % (out, err))
+    rc, out, err = run("rm", "work vpn", "--yes", extra_env=env_dir)
+    check(rc == 0 and "work vpn.trashed-" in out and keychain_get("work vpn") is None, "rm: exit %d %r %s" % (rc, out, err))
+    shown = wizard(["add"], os.path.join(work, "spaces-wizard"), [("Name", "tv room"), ("Token", fx_a), ("PIN", "")])
+    check(exit_code(shown) == 0 and keychain_get("tv room") == ctf_a, "the wizard refused a name with a space:\n" + shown)
 
 
 @scenario("S51 no tokens on a terminal: the view opens with an empty state, and a adds the first token")

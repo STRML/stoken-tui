@@ -22,7 +22,7 @@ GATE = 'GATED_COMMANDS = (None, "code", "export")'
 
 # name, text to find (exactly once), replacement, scenarios that must go red
 MUTANTS = [
-    ("seed on argv", 'return run_stoken([*args, "--file=/dev/fd/%d" % read_fd], stdin_text, (read_fd,))',
+    ("seed on argv", 'return run_stoken([*args, "%s=/dev/fd/%d" % (option, read_fd)], stdin_text, (read_fd,))',
      'return run_stoken([*args, "--token=" + seed], stdin_text, ())', {"S26"}),
     ("no Keychain read-back", "if kc_get(account, pin) != value:", "if False:", {"S14"}),
     ("index not rolled back", "        except BaseException:\n            write_index(aliases)\n            with contextlib.suppress(Exception):\n                kc_delete(alias)",
@@ -52,6 +52,9 @@ MUTANTS = [
     ("recovery never kept", '    if not committed or "MAC not verified" in result.stdout:', "    if True:", {"S44", "S50"}),
     ("stdout kept only for an empty template", "    if not template:\n        unlink_quiet(template_path)\n    write_private(os.path.join(workdir, OUTPUT_NAME), stdout)",
      "    if not template:\n        unlink_quiet(template_path)\n        write_private(os.path.join(workdir, OUTPUT_NAME), stdout)", {"S52"}),
+    ("names may end in a space", '{0,62}[A-Za-z0-9._-])?"', '{0,62}[A-Za-z0-9._ -])?"', {"S5"}),
+    ("trashed names refuse spaces", 'ACCOUNT_RE = re.compile("^" + NAME_BODY + r"(\\.trashed-\\d+)?$")',
+     'ACCOUNT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}(\\.trashed-\\d+)?$")', {"S53"}),
     ("recovery dropped after a Keychain failure", "    except BaseException:\n        note_kept(workdir)\n        raise",
      "    except BaseException:\n        shutil.rmtree(workdir, ignore_errors=True)\n        raise", {"S43"}),
     ("template tag not fixed", 'fixed = template.replace("DefAddPin>", "DefAddPIN>")', "fixed = template", {"S35", "S36"}),
