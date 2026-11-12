@@ -20,7 +20,9 @@ import subprocess
 import sys
 import termios
 import time
+import tempfile
 import tty
+import urllib.parse
 from dataclasses import dataclass
 from typing import Optional
 
@@ -38,6 +40,15 @@ KEYCHAIN_NOT_FOUND = 44
 MAX_TOKEN_BYTES = 32000
 BAR_WIDTH = 10
 GATED_COMMANDS = (None, "code", "export")
+CTKIP_LINK_RE = re.compile(r"^com\.rsa\.securid(\.iphone)?://ctkip\b", re.I)
+ACTIVATION_CODE_RE = re.compile(r"^[A-Za-z0-9]{4,40}$")
+HOSTNAME_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$")
+HEX_RUN_RE = re.compile(r"\b[0-9a-fA-F]{32}\b")
+NO_SHEBANG_INTERPRETERS = ("sh", "bash", "zsh", "dash", "env")
+NAME_PROMPT = "Name for this token: "
+TOKEN_PROMPT = "Token (paste a link or string, or give an .sdtid path; hidden): "
+PIN_PROMPT = "PIN (Enter if the token has none): "
+PROMPT_TRIES = 3
 TOUCH_ID_REASON = "unlock your SecurID tokens"
 HELPER_SOURCE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "touchid.swift")
 
@@ -72,6 +83,16 @@ class Row:
 
 def token_dir():
     return os.path.expanduser(os.environ.get("STOKEN_TUI_DIR", "~/.stoken"))
+
+
+def cache_path():
+    return os.path.expanduser(os.environ.get("STOKEN_TUI_CACHE", "~/.cache/stoken-tui"))
+
+
+def cache_dir():
+    path = cache_path()
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    return path
 
 
 def ensure_token_dir():
@@ -132,7 +153,7 @@ def unlink_quiet(path):
 
 # stoken ---------------------------------------------------------------------------------------
 
-def call_stoken(args, stdin_text="", seed=None):
+def call_stoken(args, stdin_text="", seed=None, option="--file"):
     """Run stoken. A seed travels on a pipe file descriptor, never in argv, a file or the environment."""
     if seed is None:
         return run_stoken(args, stdin_text, ())
@@ -140,7 +161,7 @@ def call_stoken(args, stdin_text="", seed=None):
     try:
         os.write(write_fd, (seed + "\n").encode())
         os.close(write_fd)
-        return run_stoken([*args, "--file=/dev/fd/%d" % read_fd], stdin_text, (read_fd,))
+        return run_stoken([*args, "%s=/dev/fd/%d" % (option, read_fd)], stdin_text, (read_fd,))
     finally:
         os.close(read_fd)
 
@@ -183,6 +204,222 @@ def normalize_seed(raw):
     if res.returncode != 0 or not SEED_RE.fullmatch(seed):
         raise Fail("not a usable token: " + first_line(res.stderr or res.stdout))
     return seed
+
+
+# CT-KIP provisioning ----------------------------------------------------------------------------
+# An activation link holds a one-time code and a server URL, not a seed. rsa_ct_kip's client trades the
+# code for a seed. The server commits the token before we hold it, so every path below either keeps a
+# recovery copy or knows there is nothing to keep. Design and failure matrix: docs/plan.md.
+
+TEMPLATE_NAME = "template.xml"
+RECOVERY_NAME = "recovery.sdtid"
+OUTPUT_NAME = "helper-output.txt"
+CTKIP_STUB = """import sys
+from rsa_ct_kip import client
+code = sys.stdin.readline().strip()
+make_session = client.requests.session
+
+
+def closing_session():
+    session = make_session()
+    session.headers["Connection"] = "close"
+    return session
+
+
+client.requests.session = closing_session
+client.stoken = None
+client.main(sys.argv[1:2] + [code] + sys.argv[2:3])
+"""
+
+
+@dataclass
+class HelperResult:
+    returncode: Optional[int] = None
+    stdout: str = ""
+    stderr: str = ""
+    timed_out: bool = False
+
+
+def one_value(query, name):
+    values = query.get(name, [])
+    if len(values) != 1 or not values[0]:
+        raise Fail("the activation link needs exactly one %s" % name)
+    return values[0]
+
+
+def check_ctkip_url(url):
+    parts = urllib.parse.urlsplit(url)
+    if re.search(r"[\s\x00-\x1f\x7f]", url):
+        raise Fail("the url in the activation link has whitespace or control characters in it")
+    if parts.scheme != "https" or not parts.hostname or not HOSTNAME_RE.fullmatch(parts.hostname):
+        raise Fail("the url in the activation link must be an https address")
+    if parts.username is not None or parts.password is not None:
+        raise Fail("the url in the activation link must not carry a user name or password")
+    return url
+
+
+def parse_ctkip_link(text):
+    """Return (url, activation code) for a CT-KIP activation link, or None for any other text."""
+    link = text.strip()
+    if not CTKIP_LINK_RE.match(link):
+        return None
+    if re.search(r"[\s\x00-\x1f\x7f]", link):
+        raise Fail("the activation link has whitespace or control characters in it")
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(link).query, keep_blank_values=True)
+    code = one_value(query, "activationCode")
+    if not ACTIVATION_CODE_RE.fullmatch(code):
+        raise Fail("the activation code must be 4 to 40 letters and digits")
+    return check_ctkip_url(one_value(query, "url")), code
+
+
+def find_helper():
+    """Return the Python that runs rsa_ct_kip, taken from the script's shebang line."""
+    path = os.environ.get("STOKEN_TUI_CTKIP") or shutil.which("rsa_ct_kip")
+    if not path or not os.path.isfile(path) or not os.access(path, os.X_OK):
+        raise Usage("rsa_ct_kip not found: install it with `pip install rsa-ct-kip`, or set STOKEN_TUI_CTKIP to the script")
+    with open(path, "rb") as f:
+        first = f.readline(512).decode(errors="replace").strip()
+    found = re.fullmatch(r"#!\s*(/\S+)", first)
+    interpreter = found.group(1) if found else None
+    if not interpreter or os.path.basename(interpreter) in NO_SHEBANG_INTERPRETERS or not os.access(interpreter, os.X_OK):
+        raise Usage("cannot tell which Python runs %s (its first line must name one by absolute path): "
+                    "set STOKEN_TUI_CTKIP to a pip-installed rsa_ct_kip script" % path)
+    return interpreter
+
+
+def ctkip_timeout():
+    return float(os.environ.get("STOKEN_TUI_CTKIP_TIMEOUT", "60"))
+
+
+def stop_group(proc):
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, signal.SIGKILL)
+    try:
+        return proc.communicate(timeout=5)
+    except Exception:
+        return "", ""
+
+
+def run_helper(interpreter, url, code, workdir, result):
+    """Run the client in its own session, with the code on stdin. Anything that stops us kills the group."""
+    environment = {k: v for k, v in os.environ.items() if k not in ("STOKEN_TUI_PIN", "STOKEN_TUI_PASSWORD")}
+    environment["TMPDIR"] = workdir
+    proc = subprocess.Popen([interpreter, "-u", "-I", "-c", CTKIP_STUB, url, os.path.join(workdir, TEMPLATE_NAME)],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            errors="replace", env=environment, start_new_session=True)
+    try:
+        result.stdout, result.stderr = proc.communicate(code + "\n", timeout=ctkip_timeout())
+        result.returncode = proc.returncode
+    except subprocess.TimeoutExpired:
+        result.stdout, result.stderr = stop_group(proc)
+        result.timed_out = True
+    except BaseException:
+        result.stdout, result.stderr = stop_group(proc)
+        raise
+
+
+def phase_note(stdout):
+    if "Token seed:" in stdout:
+        return "The server issued the token, so the activation code is spent."
+    if "Sending ServerFinished request" in stdout:
+        return "The server may already have issued the token, so the activation code may already be spent."
+    return "The server had not issued a token, so the activation code is probably still unspent."
+
+
+def scrub(text, code):
+    return HEX_RUN_RE.sub("***", text.replace(code, "***"))
+
+
+def fix_template(template):
+    """rsa_ct_kip writes DefAddPin, which stoken ignores; a PINless token also needs DefLocalPIN 0."""
+    fixed = template.replace("DefAddPin>", "DefAddPIN>")
+    if "<DefLocalPIN>" not in fixed and "<DefAddPIN>0</DefAddPIN>" in fixed:
+        fixed = fixed.replace("</DefAddPIN>", "</DefAddPIN><DefLocalPIN>0</DefLocalPIN>", 1)
+    return fixed
+
+
+def sdtid_from_template(template):
+    res = call_stoken(["export", "--random", "--sdtid"], seed=fix_template(template), option="--template")
+    if res.returncode != 0 or "<" not in res.stdout:
+        raise Fail("stoken could not build a token from the issued template: " + first_line(res.stderr or res.stdout))
+    return res.stdout
+
+
+def write_private(path, text):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+
+
+def read_if_any(path):
+    try:
+        with open(path, errors="replace") as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
+
+
+def seed_from_run(workdir, result, code):
+    note = phase_note(result.stdout)
+    if result.timed_out:
+        raise Fail("rsa_ct_kip timed out after %g s. %s" % (ctkip_timeout(), note))
+    if result.returncode != 0:
+        cause = scrub(first_line(result.stderr), code) if result.stderr.strip() else "no error text"
+        raise Fail("rsa_ct_kip failed: %s. %s" % (cause, note))
+    if "MAC verified" not in result.stdout or "MAC not verified" in result.stdout:
+        raise Fail("the server's MAC did not verify, so the token was discarded. Ask the issuer for a new link.")
+    template_path = os.path.join(workdir, TEMPLATE_NAME)
+    template = read_if_any(template_path).strip()
+    if not template:
+        raise Fail("rsa_ct_kip finished without writing a token. " + note)
+    sdtid = sdtid_from_template(template)
+    write_private(os.path.join(workdir, RECOVERY_NAME), sdtid)
+    unlink_quiet(template_path)
+    return normalize_seed(sdtid)
+
+
+def save_recovery(workdir, template, stdout):
+    template_path = os.path.join(workdir, TEMPLATE_NAME)
+    recovery = os.path.join(workdir, RECOVERY_NAME)
+    if template and not os.path.exists(recovery):
+        with contextlib.suppress(Fail):
+            write_private(recovery, sdtid_from_template(template))
+    if os.path.exists(recovery):
+        unlink_quiet(template_path)
+    elif not template:
+        unlink_quiet(template_path)
+        write_private(os.path.join(workdir, OUTPUT_NAME), stdout)
+
+
+def note_kept(workdir):
+    print("The server has issued this token, so its one-time code is spent. A recovery copy is kept in %s (mode 0700): %s."
+          % (workdir, ", ".join(sorted(os.listdir(workdir)))), file=sys.stderr)
+    print("For recovery.sdtid, run `stoken-tui add NAME --file %s`, and trash the directory once the token works."
+          % os.path.join(workdir, RECOVERY_NAME), file=sys.stderr)
+
+
+def settle_run_dir(workdir, result):
+    """Delete the run directory unless the server may have issued a token; then keep a recovery copy in it."""
+    template = read_if_any(os.path.join(workdir, TEMPLATE_NAME)).strip()
+    committed = bool(template) or "Token seed:" in result.stdout
+    if not committed or "MAC not verified" in result.stdout:
+        shutil.rmtree(workdir, ignore_errors=True)
+        return
+    with contextlib.suppress(Exception):
+        save_recovery(workdir, template, result.stdout)
+    note_kept(workdir)
+
+
+def provision_ctkip(url, code, interpreter):
+    """Return (run directory, 81-digit seed). The directory holds recovery.sdtid until the caller deletes it."""
+    workdir = tempfile.mkdtemp(prefix="ctkip-", dir=cache_dir())
+    result = HelperResult()
+    try:
+        run_helper(interpreter, url, code, workdir, result)
+        return workdir, seed_from_run(workdir, result, code)
+    except BaseException:
+        settle_run_dir(workdir, result)
+        raise
 
 
 # Keychain -------------------------------------------------------------------------------------
@@ -296,7 +533,7 @@ def render_frame(rows, now):
     return "\n".join(render_row(r, width, now) for r in rows)
 
 
-EMPTY_HINT = "No tokens yet. Add one with: stoken-tui add ALIAS --file TOKEN.sdtid"
+EMPTY_HINT = "No tokens yet. Add one with: stoken-tui add"
 
 
 # Live view --------------------------------------------------------------------------------------
@@ -310,11 +547,11 @@ BAR_MAX = 32
 SGR = {"bold": "1", "dim": "2", "red": "31", "green": "32", "yellow": "33", "cyan": "36"}
 KEY_TOKENS = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z~]|\x1bO[A-Za-z]|\x1b|.", re.S)
 KEY_NAMES = {b"\x1b[A": "up", b"\x1bOA": "up", b"k": "up", b"\x1b[B": "down", b"\x1bOB": "down", b"j": "down",
-             b"c": "copy", b"\r": "copy", b"\n": "copy", b"n": "next", b"q": "quit", b"\x1b": "quit", b"\x03": "quit"}
+             b"c": "copy", b"\r": "copy", b"\n": "copy", b"n": "next", b"a": "add", b"q": "quit", b"\x1b": "quit", b"\x03": "quit"}
 UNICODE_GLYPHS = {"marker": "▌", "full": "━", "half": "╸", "empty": "─", "rule": "─", "ok": "✓", "err": "!",
-                  "wait": "…", "hint": "↑↓ select    Enter copy    n copy next    q quit"}
+                  "wait": "…", "hint": "↑↓ select    Enter copy    n copy next    a add    q quit"}
 ASCII_GLYPHS = {"marker": ">", "full": "#", "half": "#", "empty": "-", "rule": "-", "ok": "*", "err": "!",
-                "wait": "...", "hint": "up/down select    Enter copy    n copy next    q quit"}
+                "wait": "...", "hint": "up/down select    Enter copy    n copy next    a add    q quit"}
 
 
 def pick_glyphs():
@@ -410,6 +647,8 @@ def frame_lines(rows, selected, toast, size, now, glyphs):
     gap = max(1, width - 1 - len("stoken-tui") - len(count) - 2)
     lines = [render_line([(" ", ()), ("stoken-tui", ("bold",)), (" " * gap, ()), (count, ("dim",))], width),
              render_line([(" " + glyphs["rule"] * (width - 2), ("dim",))], width), ""]
+    if not rows:
+        lines.append(render_line([(" No tokens yet. Press a to add one.", ("dim",))], width))
     per_page = max(1, (height - FOOTER_LINES - 3) // CARD_HEIGHT)
     start = max(0, selected - per_page + 1)
     for index in range(start, min(len(rows), start + per_page)):
@@ -457,6 +696,26 @@ def clear_clipboard(code):
         subprocess.run(["pbcopy"], input="", text=True)
 
 
+def add_from_view(fd, saved):
+    """Leave the live view, run the add flow on the plain terminal, then put the view back."""
+    os.write(1, b"\x1b[?25h\x1b[?1049l")
+    termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+    added, problem = None, None
+    try:
+        added = add_flow(None, None, True)
+    except (Fail, KeychainUnavailable) as e:
+        problem = str(e)
+    except (KeyboardInterrupt, EOFError):
+        problem = "cancelled"
+    if problem:
+        print("stoken-tui: %s" % problem)
+        with contextlib.suppress(KeyboardInterrupt, EOFError):
+            input("Press Enter to return to the view.")
+    tty.setcbreak(fd)
+    os.write(1, b"\x1b[?1049h\x1b[?25l")
+    return added
+
+
 def run_live(glyphs):
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
@@ -474,8 +733,17 @@ def run_live(glyphs):
             for key in parse_keys(os.read(fd, 64)) if select.select([fd], [], [], 0.25)[0] else []:
                 if key == "quit":
                     return 0
+                if key == "add":
+                    if clip:
+                        clear_clipboard(clip[0])
+                        clip = None
+                    added = add_from_view(fd, saved)
+                    rows, pending = [Row(a) for a in list_aliases()], {}
+                    selected = next((i for i, r in enumerate(rows) if r.alias == added), min(selected, max(0, len(rows) - 1)))
+                    toast = ("added %s" % added, time.time() + 2) if added else toast
+                    continue
                 selected = move(key, selected, len(rows))
-                if key in ("copy", "next"):
+                if rows and key in ("copy", "next"):
                     toast, clip = copy_code(rows[selected], now, upcoming=key == "next")
             if clip and now >= clip[1]:
                 clear_clipboard(clip[0])
@@ -509,9 +777,6 @@ def cmd_frame(args):
 
 def cmd_live(args):
     need_stoken()
-    if not list_aliases():
-        print(EMPTY_HINT)
-        return 0
     exit_on_signal()
     status = run_live(pick_glyphs())
     sys.stdout.flush()
@@ -555,13 +820,23 @@ def ask_secret(env_name, prompt):
     return getpass.getpass(prompt) or None
 
 
+def read_token_file(path):
+    with open(path, errors="replace") as f:
+        return f.read(MAX_TOKEN_BYTES + 1).strip()
+
+
+def token_from_entry(entry):
+    """A typed or dropped entry is the path of an existing file (quotes and `\\ ` undone), or the token itself."""
+    path = os.path.expanduser(re.sub(r"\\(.)", r"\1", entry.strip("'\"")))
+    return read_token_file(path) if os.path.isfile(path) else entry
+
+
 def read_token_text(args):
     if args.file:
         if not os.path.isfile(args.file):
             raise Fail("no such file: %s" % args.file)
-        with open(args.file, errors="replace") as f:
-            return f.read(MAX_TOKEN_BYTES + 1).strip()
-    data = (getpass.getpass("Token (hidden): ") if sys.stdin.isatty() else sys.stdin.read()).strip()
+        return read_token_file(args.file)
+    data = token_from_entry(getpass.getpass(TOKEN_PROMPT).strip()) if sys.stdin.isatty() else sys.stdin.read().strip()
     if not data:
         raise Fail("no token given")
     return data
@@ -602,14 +877,100 @@ def register(alias, seed, pin):
             raise
 
 
+def ask_line(prompt, secret=False):
+    try:
+        return (getpass.getpass(prompt) if secret else input(prompt)).strip()
+    except EOFError:
+        raise Fail("cancelled")
+
+
+def preflight_alias(alias):
+    with locked_index() as aliases:
+        refuse_existing(alias, aliases)
+
+
+def prompt_alias():
+    for _ in range(PROMPT_TRIES):
+        name = ask_line(NAME_PROMPT)
+        try:
+            check_alias(name)
+            preflight_alias(name)
+            return name
+        except Fail as e:
+            print("stoken-tui: %s" % e)
+    raise Fail("no usable name given")
+
+
+def prompt_token_text():
+    for _ in range(PROMPT_TRIES):
+        entry = ask_line(TOKEN_PROMPT, secret=True)
+        if entry:
+            return token_from_entry(entry)
+        print("stoken-tui: no token given")
+    raise Fail("no token given")
+
+
+def confirm_provisioning(url, interactive):
+    host = urllib.parse.urlsplit(url).hostname
+    if not interactive:
+        print("Provisioning from %s." % host, file=sys.stderr)
+        return
+    print("This link will contact %s and spend its one-time activation code." % host)
+    print("The code works once. Save the original link in your password manager before you continue.")
+    if ask_line("Continue? [y/N] ").lower() != "y":
+        raise Fail("cancelled")
+
+
+def add_token(alias, text, link, interpreter, pin, interactive):
+    """Store a token and return True when it came from an activation link."""
+    if link is None:
+        register(alias, normalize_seed(text), pin)
+        return False
+    confirm_provisioning(link[0], interactive)
+    workdir, seed = provision_ctkip(link[0], link[1], interpreter)
+    try:
+        register(alias, seed, pin)
+    except BaseException:
+        note_kept(workdir)
+        raise
+    shutil.rmtree(workdir, ignore_errors=True)
+    return True
+
+
+def report_added(alias, provisioned):
+    print("Added %s." % alias)
+    if provisioned:
+        print("The activation link is spent. Save the seed in your password manager:")
+        print("`stoken-tui export %s` prints it." % alias)
+        return
+    print("Keep the original token (.sdtid file or activation link) in your password manager: it is the")
+    print("recovery copy. `stoken-tui export %s` prints the seed if you want that saved too." % alias)
+
+
+def add_flow(alias, text, interactive):
+    """Ask for whatever is missing, check everything before the code is spent, then add. Returns the alias."""
+    if alias is None:
+        alias = prompt_alias()
+    else:
+        check_alias(alias)
+        preflight_alias(alias)
+    if text is None:
+        text = prompt_token_text()
+    link = parse_ctkip_link(text)
+    interpreter = find_helper() if link else None
+    pin = ask_secret("STOKEN_TUI_PIN", PIN_PROMPT)
+    report_added(alias, add_token(alias, text, link, interpreter, pin, interactive))
+    return alias
+
+
 def cmd_add(args):
     need_stoken()
-    check_alias(args.alias)
-    pin = ask_secret("STOKEN_TUI_PIN", "PIN (Enter if the token has none): ")
-    register(args.alias, normalize_seed(read_token_text(args)), pin)
-    print("Added %s." % args.alias)
-    print("Keep the original token (.sdtid file or activation link) in your password manager: it is the")
-    print("recovery copy. `stoken-tui export %s` prints the seed if you want that saved too." % args.alias)
+    exit_on_signal()
+    interactive = sys.stdin.isatty()
+    has_source = bool(args.file or args.token)
+    if not interactive and not (args.alias and has_source):
+        raise Usage("add needs ALIAS and --file F or --token - when stdin is not a terminal")
+    add_flow(args.alias, read_token_text(args) if has_source else None, interactive)
     return 0
 
 
@@ -689,7 +1050,7 @@ def cmd_rm(args):
 def helper_path():
     """Build touchid.swift once per source version and reuse the binary."""
     digest = hashlib.sha256(open(HELPER_SOURCE, "rb").read()).hexdigest()[:12]
-    cache = os.path.expanduser(os.environ.get("STOKEN_TUI_CACHE", "~/.cache/stoken-tui"))
+    cache = cache_path()
     exe = os.path.join(cache, "touchid-" + digest)
     if os.access(exe, os.X_OK):
         return exe
@@ -731,11 +1092,11 @@ def build_parser():
                                 description="Live view of every stoken token, seeds in the Keychain.")
     p.add_argument("--once", action="store_true", help="print one frame and exit")
     sub = p.add_subparsers(dest="cmd")
-    add = sub.add_parser("add", help="add a token under an alias")
-    add.add_argument("alias")
-    src = add.add_mutually_exclusive_group(required=True)
-    src.add_argument("--file", help="a .sdtid file, or a file holding a CTF string or link")
-    src.add_argument("--token", choices=["-"], help="read the CTF string or link from stdin")
+    add = sub.add_parser("add", help="add a token; anything not given is asked for")
+    add.add_argument("alias", nargs="?")
+    src = add.add_mutually_exclusive_group()
+    src.add_argument("--file", help="a .sdtid file, or a file holding a CTF string or an activation link")
+    src.add_argument("--token", choices=["-"], help="read the CTF string or activation link from stdin")
     adopt = sub.add_parser("adopt", help="take over an existing encrypted rc, such as ~/.stokenrc")
     adopt.add_argument("alias")
     adopt.add_argument("rcfile")
@@ -775,6 +1136,9 @@ def main(argv=None):
     except Fail as e:
         print("stoken-tui: %s" % e, file=sys.stderr)
         return e.exit_code
+    except KeyboardInterrupt:
+        print("stoken-tui: cancelled", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":

@@ -45,6 +45,21 @@ MUTANTS = [
      "        write_index(aliases + [args.new])", {"S33"}),
     ("rename drops the PIN", "            if pin:\n                kc_put(args.new, pin, pin=True)",
      "            if False:\n                kc_put(args.new, pin, pin=True)", {"S33"}),
+    ("activation code on argv", "CTKIP_STUB, url, os.path.join(workdir, TEMPLATE_NAME)]",
+     "CTKIP_STUB, url, os.path.join(workdir, TEMPLATE_NAME), code]", {"S45"}),
+    ("alias checked after provisioning", "        check_alias(alias)\n        preflight_alias(alias)", "        check_alias(alias)", {"S38"}),
+    ("MAC ignored", 'if "MAC verified" not in result.stdout or "MAC not verified" in result.stdout:', "if False:", {"S41"}),
+    ("recovery never kept", '    if not committed or "MAC not verified" in result.stdout:', "    if True:", {"S43", "S44", "S50"}),
+    ("template tag not fixed", 'fixed = template.replace("DefAddPin>", "DefAddPIN>")', "fixed = template", {"S35", "S36"}),
+    ("helper outlives a timeout", "errors=\"replace\", env=environment, start_new_session=True)",
+     "errors=\"replace\", env=environment, start_new_session=False)", {"S42", "S44"}),
+    ("host not confirmed", '    if ask_line("Continue? [y/N] ").lower() != "y":', "    if False:", {"S46"}),
+    ("activation code not scrubbed", 'return HEX_RUN_RE.sub("***", text.replace(code, "***"))', "return text", {"S40"}),
+    ("a leaves the clipboard", "                    if clip:\n                        clear_clipboard(clip[0])\n                        clip = None\n                    added =",
+     "                    added =", {"S49"}),
+    ("sh trampoline accepted", "os.path.basename(interpreter) in NO_SHEBANG_INTERPRETERS or ", "", {"S39"}),
+    ("http links accepted", 'parts.scheme != "https"', 'parts.scheme not in ("https", "http")', {"S37"}),
+    ("requests keep the connection", '    session.headers["Connection"] = "close"', "    pass", {"S35"}),
 ]
 
 

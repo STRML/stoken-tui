@@ -25,7 +25,7 @@ with it   stoken-tui ─▶ Touch ID ─▶ every code, counting down
 
 ## Install
 
-You need macOS, [stoken](https://github.com/stoken-dev/stoken) (`brew install stoken`) and Python 3.9 or later. The Touch ID helper compiles once with `swiftc`, which comes with the Xcode command line tools (`xcode-select --install`). There are no Python dependencies.
+You need macOS, [stoken](https://github.com/stoken-dev/stoken) (`brew install stoken`) and Python 3.9 or later. The Touch ID helper compiles once with `swiftc`, which comes with the Xcode command line tools (`xcode-select --install`). There are no Python dependencies. Importing an activation link also needs `rsa_ct_kip`, described under "Getting a token in the first place".
 
 ```sh
 git clone https://github.com/STRML/stoken-tui
@@ -39,6 +39,7 @@ Any directory on your `PATH` works in place of `~/.local/bin`.
 Add a token, then run `stoken-tui`.
 
 ```sh
+stoken-tui add                                # asks for a name, then the token
 stoken-tui add work --file work.sdtid         # a file from your admin
 pbpaste | stoken-tui add vpn --token -        # an activation link or CTF string
 stoken-tui adopt old ~/.stokenrc              # a token stoken already holds
@@ -60,6 +61,7 @@ The bar and the seconds go green, then yellow under 20 seconds, then red under 1
 | <kbd>↑</kbd> <kbd>↓</kbd> or <kbd>j</kbd> <kbd>k</kbd> | Move the selection |
 | <kbd>Enter</kbd> or <kbd>c</kbd> | Copy the selected code |
 | <kbd>n</kbd> | Copy the selected token's next code |
+| <kbd>a</kbd> | Add a token |
 | <kbd>q</kbd> or <kbd>Esc</kbd> | Quit |
 
 A copied code leaves the clipboard after 30 seconds, or when you quit, if nothing else has replaced it.
@@ -77,6 +79,7 @@ stoken-tui code work --next
 | You want to | Run |
 |---|---|
 | See every code, live | `stoken-tui` |
+| Add a token, step by step | `stoken-tui add`, or <kbd>a</kbd> in the live view |
 | Add a token from a file | `stoken-tui add NAME --file token.sdtid` |
 | Add a token from a link or CTF string | `pbpaste \| stoken-tui add NAME --token -` |
 | Move in a token that stoken already holds | `stoken-tui adopt NAME ~/.stokenrc` |
@@ -85,7 +88,7 @@ stoken-tui code work --next
 | Print the stored seed | `stoken-tui export NAME` |
 | Remove a token | `stoken-tui rm NAME` (`--purge` also deletes its seed) |
 
-`add` and `adopt` ask for a PIN when the terminal allows it. Press Enter if the token has none.
+`add` asks for whatever you left out: the name, then the token (hidden; paste a link or a CTF string, or drop in the path of an `.sdtid` file), then the PIN. Press Enter at the PIN if the token has none. `adopt` asks for a PIN too.
 
 Don't edit the name list by hand. The footer shows where it lives (`~/.stoken/index`), but each name is also the Keychain account that holds the seed, so changing one without the other loses the token. `rename` changes both.
 
@@ -133,9 +136,29 @@ The login keychain is the only store, and Time Machine backs it up with your hom
 
 <br>
 
-If your admin sent an activation link that looks like `com.rsa.securid://ctkip?url=...&activationCode=...`, stoken can't import it, because the link holds a one-time code and a provisioning URL, not the token. [rsa_ct_kip](https://github.com/dlenski/rsa_ct_kip) fetches the token from the server and writes the `.sdtid` file that `add --file` takes. The activation code works once, so keep the file.
+An admin may send a link like `com.rsa.securid://ctkip?url=...&activationCode=...`. Paste it into `stoken-tui add`. The link carries a one-time code and a server address, and stoken-tui trades them for the token through [rsa_ct_kip](https://github.com/dlenski/rsa_ct_kip) (`pip install rsa-ct-kip`, or point `STOKEN_TUI_CTKIP` at its script).
 
-If a token made this way shows `! PIN required` although your server uses no PIN, the template that rsa_ct_kip writes is the cause: it spells a tag `DefAddPin`, which stoken ignores ([dlenski/rsa_ct_kip#11](https://github.com/dlenski/rsa_ct_kip/pull/11)). Until that lands, run the conversion by hand with `<DefAddPIN>0</DefAddPIN>` and `<DefLocalPIN>0</DefLocalPIN>` added to the template. With both, `stoken show` reports PIN mode 0.
+```
+link ─▶ checks ─▶ you confirm the host ─▶ rsa_ct_kip ─▶ recovery.sdtid ─▶ Keychain ─▶ folder deleted
+                                          (code on stdin)  (private folder)  (read back)
+```
+
+The code works once, so:
+
+1. Save the original link in your password manager before you paste it.
+2. Don't tap the link on a phone that has the RSA app. The app would use the code first.
+3. If a step after the server's answer fails, the folder stays under `~/.cache/stoken-tui/ctkip-*` and the message names it. `stoken-tui add NAME --file <that folder>/recovery.sdtid` finishes the job. Trash the folder once the token works.
+
+| stoken-tui does | Because |
+|---|---|
+| Accepts an `https` address and a plain code, nothing else | Both values go to another program |
+| Shows the host and asks `[y/N]` before it spends the code | A link from a stranger should not get one |
+| Sends the code on stdin | argv shows up in `ps` |
+| Never prints the seed, and keeps `recovery.sdtid` until the Keychain read-back passes | The server hands the seed out once |
+| Discards the result when the server's MAC does not verify | rsa_ct_kip exits 0 and writes a token anyway |
+| Renames the `DefAddPin` tag rsa_ct_kip writes to `DefAddPIN` ([dlenski/rsa_ct_kip#11](https://github.com/dlenski/rsa_ct_kip/pull/11)) | Without it a PINless token asks for a PIN |
+
+rsa_ct_kip claims to be RSA's own client, and your issuer's policy may not allow that. Read its source before the first run.
 
 </details>
 

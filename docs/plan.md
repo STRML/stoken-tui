@@ -54,11 +54,29 @@ Rows marked "probed" were measured against stoken 0.93 and macOS 27.2's `securit
 | The next code is the code at `now + interval`, computed with `--use-time`. A row holds both, fetched together and keyed to the window of the time the codes were computed, not the time the fetch finished. `n` copies it and `code --next` prints it. | `stoken --next` can't combine with `--use-time` (the tests need it), and the two forms are identical (probed: `--next` equals `--use-time=+60`). Keying the window to the compute time stops a fetch that straddles a boundary from showing the old window's code for a whole minute. |
 | `rename OLD NEW` writes the seed (and PIN) under the new name, swaps the index entry, then deletes the old items. Any failure undoes the new items and the index. | The name is both an index entry and a Keychain account, so editing either alone loses the token. |
 | Tokens decrypt in a thread pool. A code recomputes only when its interval window changes. | One round of parallel calls covers every token. |
+| `add` sorts its token text by shape. A link with scheme `com.rsa.securid` or `com.rsa.securid.iphone` and host `ctkip` is an activation link and gets provisioned. Anything else goes to stoken as before. The observed shape is `com.rsa.securid://ctkip?url=https://HOST/ctkip/services/CtkipService&activationCode=CODE`. | The link holds a one-time code and a server URL, not a seed, so stoken cannot read it (2026-11-06: "garbled: General failure"). |
+| A link is accepted only when `url` is `https` with a host and no user info, and `activationCode` matches `[A-Za-z0-9]{4,40}`. | Both values reach another program. A leading dash, whitespace or `http` must never get that far. |
+| Provisioning runs rsa_ct_kip's own client on the interpreter named in the `rsa_ct_kip` script's shebang, as `python -I -c STUB`. The stub calls `client.main([url, code, outfile])` with the code read from stdin, so the code never reaches argv. It also makes every request send `Connection: close`. The helper is found through `STOKEN_TUI_CTKIP` or `PATH`. | The CLI takes the code as an argument, which `ps` shows. Without `Connection: close` the second POST reused the first connection and the server dropped it ("Remote end closed connection", 2026-11-06). |
+| The helper runs in a private directory (`mkdtemp`, mode 0700, under the cache dir) that is also its `TMPDIR`. Its stdout and stderr are captured and never shown. | The client prints the seed in cleartext and leaves a temp file (`delete=False`) holding it. |
+| The result counts only when stdout has `MAC verified` and not `MAC not verified`. | The client exits 0 and still writes a token when the MAC check fails. |
+| The stub sets `client.stoken = None` before `main()`, so the client writes its template straight to the file we name in the private directory, runs no `stoken` of its own and leaves no temp file. The file exists empty before any network call (argparse creates it), so "the seed is on disk" means it is non-empty and parses as a template. | The one known path replaces a search for the client's temp file. |
+| The helper runs unbuffered (`-u`) in its own session (`Popen(start_new_session=True)`). A timeout, a signal or `KeyboardInterrupt` kills the whole process group. The signal handlers are installed before the helper starts. | `subprocess.run(timeout=)` kills only the direct child, and Python's default SIGTERM skips `finally`. |
+| The `Token seed:` line in the helper's stdout marks the commit. When it is present and the template is unusable, the captured stdout goes into the kept directory as a 0600 file, and the error says so. | The client prints the seed before it writes the file, so a crash in between leaves the seed only on stdout. |
+| The error names the phase: no `Sending ServerFinished request` line in stdout means the server had not issued a token and the code is probably unspent. Otherwise it may be spent. | On 2026-11-06 the second POST failed, and that is the case that spends the code. |
+| `rsa_ct_kip` is accepted only when its shebang names an absolute path to an existing executable that is not `/bin/sh`. Anything else fails closed and points at `STOKEN_TUI_CTKIP`. | `#!/usr/bin/env python3` runs a Python without the package, and pip writes a `/bin/sh` trampoline for long paths. |
+| The token is built from that template. The template's `DefAddPin` is renamed `DefAddPIN` (client typo, dlenski/rsa_ct_kip#11), and `<DefLocalPIN>0</DefLocalPIN>` is added only when `DefAddPIN` is 0. stoken converts it in memory (`export --random --sdtid --template=/dev/fd/N`). | Probed on stoken 0.93, PIN mode by header: `DefAddPin` 0 or 1 gives 3. `DefAddPIN` 0 gives 1, and 1 gives 3. `DefAddPIN` 0 with `DefLocalPIN` 0 gives 0. `DefAddPIN` 1 with `DefLocalPIN` 0 gives 2, which is not what the server asked for, so that case is left alone. |
+| The server commits the token before we hold it, and the code works once. So before the index or the Keychain is touched, `recovery.sdtid` (mode 0600) is written into the private directory. The directory is deleted only after the Keychain read-back passes. Any later failure keeps it and prints its path, and `add NAME --file` takes that file. | A failure after the commit must not lose the only copy of the seed. |
+| Before the code is spent: the alias is valid and free (index and Keychain), stoken and the helper are found, and the Keychain answers. | A duplicate alias found after provisioning would burn the code and strand the token. |
+| Helper errors print the last stderr line with the activation code, any 32-hex string and the seed replaced by `***`, plus one line saying the code may already be spent. | A traceback or a connection error can echo request details. |
+| The helper gets 60 s (`STOKEN_TUI_CTKIP_TIMEOUT`). A timeout or a signal kills its process group, then follows the same keep-or-delete rule. | A hung server must not hang the terminal or leave a child holding the code. |
+| `add` takes an optional alias and an optional source. A missing one is asked for: the name, then the token (hidden prompt, accepts a CT-KIP link, a CTF string or link, or the path of an `.sdtid` file, with quotes and `\ ` unescaped), then the PIN. Off a terminal, it exits 2. For a CT-KIP link the wizard names the host, says the code works once and that the link belongs in a password manager first, and asks `[y/N]` before spending the code. Piped input does not ask. | A drag-and-drop path or a pasted link both work, and a phishing host is visible before the code is used. |
+| `a` in the live view clears a copied code from the clipboard, leaves the alternate screen, restores the terminal, runs the same flow, waits for Enter after an error or a cancel, puts the view back and reloads the rows. A failed or cancelled add returns to the view. | One flow, two entry points. The 30 s clipboard clear cannot fire while a prompt blocks. |
+| With no tokens on a terminal, the live view opens with an empty state ("No tokens yet. Press a to add one.") instead of exiting. Off a terminal, the frame still prints `EMPTY_HINT`. | A first-time user otherwise never reaches a screen where `a` works. |
 
 ## Interface
 
     stoken-tui                         live view: curses on a TTY, one frame otherwise
-    stoken-tui add ALIAS (--file F | --token -)    token from a file, or from stdin
+    stoken-tui add [ALIAS] [--file F | --token -]  token from a file or stdin; anything missing is asked for
     stoken-tui adopt ALIAS RCFILE      move an existing encrypted rc in
     stoken-tui code ALIAS [--next]     print one code, or the code one interval ahead
     stoken-tui rename OLD NEW          give an alias a new name
@@ -66,9 +84,10 @@ Rows marked "probed" were measured against stoken 0.93 and macOS 27.2's `securit
     stoken-tui rm ALIAS [--yes] [--purge]
     test hooks: --use-time T, --once; env STOKEN_TUI_DIR, STOKEN_TUI_SERVICE, STOKEN_TUI_SECURITY,
                 STOKEN_TUI_KEYCHAIN_TIMEOUT, STOKEN_TUI_CACHE, STOKEN_TUI_AUTH,
-                STOKEN_TUI_PASSWORD, STOKEN_TUI_PIN, STOKEN_TUI_ASCII
+                STOKEN_TUI_PASSWORD, STOKEN_TUI_PIN, STOKEN_TUI_ASCII, STOKEN_TUI_CTKIP,
+                STOKEN_TUI_CTKIP_TIMEOUT
 
-Live view keys: up/down or j/k select, Enter or c copy the code with `pbcopy`, n copy the next code, q quit.
+Live view keys: up/down or j/k select, Enter or c copy the code with `pbcopy`, n copy the next code, a add a token, q quit.
 
 A card shows the alias, the grouped code with a countdown bar and the seconds, and the next code in dim text under it. A failed token shows `! no seed in Keychain` (or the cause) in place of the code. The footer has two lines: the keys, and where the alias list lives with the `rename` hint.
 
@@ -112,6 +131,23 @@ Each row is one scenario in `tests/e2e.py`.
 | S32 `n` key | Copies the next code, not the current one | The key copies the wrong code | The pbcopy shim log must hold a next code |
 | S33 rename | Seed and PIN move; the index swaps; failures change nothing | A write fails midway; the target exists | Rollback, exit 1; the old token still works |
 | S34 footer | The alias list path and the rename hint are on screen | The footer drops them | The scenario reads the last two screen lines |
+| S35 add from a CT-KIP link | Provision through the helper, build the token, store it like any other | The helper or a later step fails | A usable token, the code matches stoken's for the issued seed, and the private directory is gone |
+| S36 token without a PIN, and with one | Fix the template tag; add `DefLocalPIN` only for `DefAddPIN` 0 | The tag is left as `DefAddPin` | A PINless token shows a code with no PIN. A token the server marked PIN-bearing still shows `! PIN required` without one. |
+| S37 hostile or malformed links | Validate before anything runs | `http`, user info, a code starting with `-`, whitespace, a missing parameter, a wrong host | Exit 1 naming the problem; the helper never runs; nothing is stored. A `ctf` link is still handed to stoken. |
+| S38 alias taken (index or orphan Keychain item) | Refuse before provisioning | Provisioning first would burn the code | Exit 1; the helper never runs |
+| S39 helper not installed, or unusable | Look it up before anything else; accept only an absolute-path, non-`sh` shebang | `env python3` or a `/bin/sh` trampoline | Exit 2 with an install hint naming `STOKEN_TUI_CTKIP`; nothing stored |
+| S40 server fault or network failure before the commit | Capture, scrub, clean up | The message echoes the code or URL details | Exit 1: scrubbed last line plus "the code may be spent"; no files left; nothing stored |
+| S41 MAC not verified | Discard the result | The client writes a token anyway | Exit 1; nothing stored; no files kept |
+| S42 helper hangs | Kill its process group at the timeout | A child outlives us holding the code | Exit 1 `timed out`; no child left; no files |
+| S43 Keychain fails after the commit | Keep `recovery.sdtid`, roll the index back | The seed is lost with the directory | Exit 1 with the kept path; `add NAME --file` that path works once the Keychain does |
+| S44 SIGTERM while the helper runs with a template written | Kill the helper, keep a recovery file | The seed is lost, or the child lives | The kept path is printed, `add --file` of it works, and no child is left |
+| S45 secrets in argv, output and files | The code travels on stdin, the seed on pipes | A change puts either in argv or the screen | Every logged argv, both output streams and every file outside the kept directory are free of the code and the seed |
+| S46 wizard on a terminal | Ask for name, token, PIN; take a path or a link; confirm a CT-KIP host | A prompt reads the wrong stream | A token lands. Answering `n` at the host question spends nothing. |
+| S47 wizard off a terminal, or half-filled | `add` with no terminal exits 2; `add NAME` with no source asks for the token | The wizard hangs on a pipe | Exit 2 with usage; nothing stored |
+| S48 wizard bad input | Re-ask a bad or taken name; refuse an empty token; Ctrl-C leaves nothing | A half-written alias | Nothing stored on any of them |
+| S49 `a` in the live view | Suspend the view, run the flow, reload the rows | The terminal is left raw, the new token is missing, or a cancel quits the view | The new alias shows with a code, `q` restores the terminal, the footer lists `a`, and Ctrl-C at a prompt returns to the view |
+| S50 helper crashes after the commit | Keep the captured stdout in a 0600 file in the kept directory | The seed exists only on stdout | Exit 1 naming the kept file; nothing is stored; the message says the code is spent |
+| S51 no tokens on a terminal | Open the view with an empty state; `a` works from it | The view exits before `a` can be pressed | The hint shows, `a` adds a token, and the row appears |
 | Resize, Ctrl-C, SIGTERM | The terminal size is read every tick; `finally` restores the cursor, the alternate screen and the tty modes | A killed view leaves the terminal raw | Restored on every exit path |
 
 ## Limits
@@ -127,4 +163,6 @@ Each row is one scenario in `tests/e2e.py`.
   account by hand.
 - A password-protected sdtid file cannot be added directly: import and decrypt it with stoken first,
   then `adopt` the rc.
-- The tool does not import CT-KIP links. `rsa_ct_kip` does that.
+- CT-KIP provisioning needs `rsa_ct_kip` (a PyPI package, `dlenski/rsa_ct_kip`, MIT). It handles a one-time secret, so read its source before the first run. It claims to be RSA's client (`Manufacturer: RSA Security Inc.`), and your issuer's policy may not allow a third-party one.
+- The activation code works once. If the helper fails after the server answered, only the issuer can send a new link.
+- While the helper runs, the seed exists on disk in the private directory, and on a failure it stays there on purpose.
