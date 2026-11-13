@@ -62,6 +62,7 @@ The bar and the seconds go green, then yellow under 20 seconds, then red under 1
 | <kbd>Enter</kbd> or <kbd>c</kbd> | Copy the selected code |
 | <kbd>n</kbd> | Copy the selected token's next code |
 | <kbd>a</kbd> | Add a token |
+| <kbd>r</kbd> | Rename the selected token |
 | <kbd>q</kbd> or <kbd>Esc</kbd> | Quit |
 
 A copied code leaves the clipboard after 30 seconds, or when you quit, if nothing else has replaced it.
@@ -185,9 +186,9 @@ rsa_ct_kip claims to be RSA's own client, and your issuer's policy may not allow
 python3 tests/e2e.py
 ```
 
-The suite runs 34 scenarios against a temporary directory and a throwaway Keychain service, with `stoken` and `pbcopy` wrapped in shims that log every call. It checks what reached each command line (no seed, PIN or password may), what ended up on disk (no seed anywhere), and what the screen looks like in a real tmux pane. It needs the real `stoken`, `security` and `tmux`, and Touch ID is stubbed out.
+The suite runs 55 scenarios against a temporary directory and a throwaway Keychain service, with `stoken` and `pbcopy` wrapped in shims that log every call. It checks what reached each command line (no seed, PIN or password may), what ended up on disk (no seed anywhere), and what the screen looks like in a real tmux pane. It needs the real `stoken`, `security` and `tmux`, and Touch ID is stubbed out.
 
-A passing suite says little if a scenario can't fail. `python3 tests/mutants.py` breaks the tool in 18 named ways, one line each, and checks that the scenario guarding each one goes red. A full run takes about 40 minutes, so it isn't part of CI. `--check` confirms the mutations still apply to the source in a second.
+A passing suite says little if a scenario can't fail. `python3 tests/mutants.py` breaks the tool in 37 named ways, one line each, and checks that the scenario guarding each one goes red. Each mutation reruns the suite (about 2 minutes), so a full run isn't part of CI. `--check` confirms the mutations still apply to the source in a second.
 
 The screenshots and the animation come from made-up tokens. `demo/fixture.py` builds five of them with different intervals, and `vhs demo/demo.tape` re-renders everything. The design notes and the failure matrix behind each scenario are in [docs/plan.md](docs/plan.md).
 
